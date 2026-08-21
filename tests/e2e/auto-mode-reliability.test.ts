@@ -1038,63 +1038,6 @@ describe("lean auto mode reliability", () => {
     TIMEOUT,
   );
 
-  test.skipIf(process.platform !== "darwin")(
-    "headless sandbox widening finishes normally after four blocked groups",
-    async () => {
-      const root = createIsolatedRoot("/Users/Shared");
-      const marker = join(root.workspace, "sandbox-widening-must-not-run");
-      const command = `npm install && printf blocked > ${JSON.stringify(marker)}`;
-      writeFileSync(
-        join(root.home, ".fx", "settings.json"),
-        JSON.stringify({
-          sandbox: "os",
-          permission: { bash: { [command]: "allow" } },
-          maxxing_mode: "legacy",
-        }),
-      );
-      const gateway = startGateway(
-        [
-          ...Array.from({ length: 4 }, (_, index) => (body?: string) => {
-            if (index > 0) expect(body).toContain("auto_denied");
-            if (index === 3) expect(body).not.toContain('"tools":[]');
-            return commandCall(command, `sandbox_widening_${index + 1}`);
-          }),
-        ],
-        [
-          fakeGatewayPermissionDecision("ask", "sandbox_review_1"),
-          fakeGatewayFinalText("malformed reviewer output"),
-          fakeGatewayPermissionDecision("ask", "sandbox_review_3"),
-          fakeGatewayPermissionDecision("ask", "sandbox_review_4"),
-        ],
-      );
-
-      const result = await runFx(
-        ["ask", "--quiet", "--json", "--no-save", "Install the dependencies."],
-        {
-          cwd: root.workspace,
-          env: { ...gatewayEnv(root, gateway), TMPDIR: "/private/tmp" },
-          timeoutMs: TIMEOUT,
-        },
-      );
-
-      expect(result.code).toBe(0);
-      expect(result.stderr).not.toContain("permission required");
-      expect(result.stderr).not.toContain("noninteractive_permission_prompt_unavailable");
-      expect(gateway.requests).toHaveLength(4);
-      expect(gateway.classifierRequests).toHaveLength(4);
-      for (const request of gateway.classifierRequests) {
-        expect(request.body).toContain("phase: preflight");
-        expect(request.body).toContain("action: sandbox_widening");
-      }
-      const json = JSON.parse(result.stdout.trim()) as { output: string };
-      expect(json.output).toContain(
-        "I couldn't continue because the required actions were blocked by automatic safety checks.",
-      );
-      expect(existsSync(marker)).toBe(false);
-    },
-    TIMEOUT,
-  );
-
   test.skipIf(!tmuxAvailable())(
     "a prompt-capable host also lets the agent recover before asking the user",
     async () => {

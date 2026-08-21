@@ -1011,7 +1011,6 @@ fn clone_principal(
         .workspace_root = workspace_root,
         .cwd = try alloc.dupe(u8, principal.cwd),
         .transport_role = principal.transport_role,
-        .sandbox_backend = principal.sandbox_backend,
         .backend = principal.backend,
         .lifetime = principal.lifetime,
     };
@@ -1065,7 +1064,6 @@ fn clone_optional_owner_catalog_claim(
                 value.principal.workspace_root,
             ),
             .transport_role = value.principal.transport_role,
-            .sandbox_backend = value.principal.sandbox_backend,
         },
         .actor = value.actor,
         .proof = value.proof,
@@ -1759,7 +1757,6 @@ pub const Principal = struct {
     workspace_root: []const u8,
     cwd: []const u8,
     transport_role: TransportRole,
-    sandbox_backend: types.BackendKind,
     backend: Backend,
     lifetime: TerminalLifetime = .session,
 
@@ -1779,7 +1776,6 @@ pub const Principal = struct {
             std.mem.eql(u8, self.workspace_root, other.workspace_root) and
             std.mem.eql(u8, self.cwd, other.cwd) and
             self.transport_role == other.transport_role and
-            self.sandbox_backend == other.sandbox_backend and
             self.backend == other.backend and
             self.lifetime == other.lifetime;
     }
@@ -1790,7 +1786,6 @@ pub const OwnerCatalogPrincipal = struct {
     durable_session_id: []const u8,
     workspace_root: []const u8,
     transport_role: TransportRole,
-    sandbox_backend: types.BackendKind,
 
     pub fn validate(self: OwnerCatalogPrincipal) error{
         InvalidPrincipal,
@@ -1808,8 +1803,7 @@ pub const OwnerCatalogPrincipal = struct {
         return std.mem.eql(u8, self.profile_user, other.profile_user) and
             std.mem.eql(u8, self.durable_session_id, other.durable_session_id) and
             std.mem.eql(u8, self.workspace_root, other.workspace_root) and
-            self.transport_role == other.transport_role and
-            self.sandbox_backend == other.sandbox_backend;
+            self.transport_role == other.transport_role;
     }
 };
 
@@ -2410,6 +2404,7 @@ pub const StructuredErrorCode = enum {
     session_not_found,
     invalid_lifecycle,
     authority_denied,
+    authority_retired,
     lease_conflict,
     cursor_gap,
     screen_unavailable,
@@ -3388,7 +3383,6 @@ test "start persistence binds authority to cwd backend and a nonzero proof" {
                 .workspace_root = "/workspace",
                 .cwd = "/workspace",
                 .transport_role = .interactive,
-                .sandbox_backend = .none,
                 .backend = .native,
             },
             .actor = .agent,
@@ -3449,7 +3443,6 @@ fn check_owned_action_request_allocation_failures(alloc: Allocator) !void {
                     .workspace_root = "/workspace",
                     .cwd = "/workspace",
                     .transport_role = .interactive,
-                    .sandbox_backend = .none,
                     .backend = .native,
                 },
                 .actor = .agent,
@@ -4009,7 +4002,6 @@ fn test_principal() Principal {
         .workspace_root = "/workspace",
         .cwd = "/workspace/src",
         .transport_role = .interactive,
-        .sandbox_backend = .macos,
         .backend = .native,
     };
 }

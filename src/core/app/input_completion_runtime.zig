@@ -10,7 +10,6 @@ const display_width = @import("../shared/display_width.zig");
 const list_window = @import("../shared/list_window.zig");
 const model_capabilities = @import("../config/model_capabilities.zig");
 const command_specs = @import("../slash_commands/command_specs.zig");
-const sandbox = @import("../permissions/sandbox.zig");
 const session_commands = @import("../session/session_commands.zig");
 const skill_runtime = @import("../skills/skill_runtime.zig");
 const text_utils = @import("../shared/text_utils.zig");
@@ -597,8 +596,6 @@ pub fn CompletionRuntime(comptime App: type) type {
         fn currentArgLabel(app: *App, trimmed: []const u8) ?[]const u8 {
             if (command_specs.inputArgCompletionPrefix(trimmed) != null)
                 return app.input_runtime.input_appearance.label();
-            if (command_specs.sandboxArgCompletionPrefix(trimmed) != null)
-                return sandbox.publicModeForBackend(app.permission_state.sandbox_backend).label();
             return null;
         }
 
@@ -1409,9 +1406,9 @@ const inline_completion_test_slash_specs = [_]command_specs.SlashSpec{
         .help_entry = "/resume",
     },
     .{
-        .kind = .sandbox,
-        .command = "/sandbox",
-        .help_entry = "/sandbox [os|none]",
+        .kind = .appearance,
+        .command = "/maxxing",
+        .help_entry = "/maxxing [minimal|normal]",
         .has_args = true,
     },
 };
@@ -1584,7 +1581,7 @@ test "root slash completion follows multiline and command argument ownership" {
     try std.testing.expectEqual(@as(usize, 0), rt.visibleSlashCompletionCount(&app));
     try std.testing.expect(!rt.dismissVisibleInlinePicker(&app));
 
-    try app.input_runtime.textReplacementState().replace(alloc, "/sandbox ");
+    try app.input_runtime.textReplacementState().replace(alloc, "/maxxing ");
     try std.testing.expectEqual(@as(usize, 2), rt.visibleSlashCompletionCount(&app));
 }
 

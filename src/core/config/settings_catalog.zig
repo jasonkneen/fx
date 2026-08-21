@@ -26,7 +26,6 @@ pub const category_count = std.meta.fields(Category).len;
 pub const SettingId = enum {
     input_appearance,
     maxxing_mode,
-    statusline_sandbox,
     statusline_context,
     statusline_session,
     statusline_workspace,
@@ -36,7 +35,6 @@ pub const SettingId = enum {
     fast_mode,
     permission_mode,
     sound_level,
-    sandbox,
     startup_scrollback,
     prompt_history,
 };
@@ -57,7 +55,6 @@ pub const Snapshot = struct {
     permission_mode: []const u8 = "ask",
     input_appearance: []const u8 = input_appearance.InputAppearance.default.label(),
     maxxing_mode: []const u8 = "minimal",
-    statusline_sandbox: bool = false,
     statusline_context: bool = false,
     statusline_session: bool = false,
     statusline_workspace: bool = false,
@@ -65,7 +62,6 @@ pub const Snapshot = struct {
     startup_scrollback: bool = true,
     prompt_history: bool = true,
     sound_level: []const u8 = "on",
-    sandbox: []const u8 = "os",
 
     pub fn value(self: Snapshot, id: SettingId) []const u8 {
         return switch (id) {
@@ -75,7 +71,6 @@ pub const Snapshot = struct {
             .permission_mode => self.permission_mode,
             .input_appearance => self.input_appearance,
             .maxxing_mode => self.maxxing_mode,
-            .statusline_sandbox => onOff(self.statusline_sandbox),
             .statusline_context => onOff(self.statusline_context),
             .statusline_session => onOff(self.statusline_session),
             .statusline_workspace => onOff(self.statusline_workspace),
@@ -83,7 +78,6 @@ pub const Snapshot = struct {
             .startup_scrollback => onOff(self.startup_scrollback),
             .prompt_history => onOff(self.prompt_history),
             .sound_level => self.sound_level,
-            .sandbox => self.sandbox,
         };
     }
 };
@@ -227,11 +221,6 @@ pub const StatuslineChoice = struct {
 
 const statusline_choices = [_]StatuslineChoice{
     .{
-        .label = "Sandbox",
-        .description = "Show the active sandbox mode",
-        .setting = .statusline_sandbox,
-    },
-    .{
         .label = "Context",
         .description = "Show context-window usage",
         .setting = .statusline_context,
@@ -289,71 +278,6 @@ pub fn statuslineChoiceCount() usize {
 pub fn statuslineChoiceAt(index: usize) ?StatuslineChoice {
     if (index >= statusline_choices.len) return null;
     return statusline_choices[index];
-}
-
-pub const SandboxChoice = struct {
-    label: []const u8,
-    description: []const u8,
-    change: Change,
-
-    pub fn isCurrent(self: SandboxChoice, snapshot: Snapshot) bool {
-        return std.mem.eql(u8, snapshot.value(self.change.setting), self.change.value);
-    }
-};
-
-const sandbox_choices = [_]SandboxChoice{
-    .{
-        .label = "OS sandbox",
-        .description = "Restrict command writes to the workspace and /tmp",
-        .change = .{ .setting = .sandbox, .value = "os" },
-    },
-    .{
-        .label = "None",
-        .description = "Run commands without sandbox isolation",
-        .change = .{ .setting = .sandbox, .value = "none" },
-    },
-};
-
-pub const SandboxMenu = struct {
-    active: bool = false,
-    selected_index: usize = 0,
-
-    pub fn open(self: *SandboxMenu) void {
-        self.* = .{ .active = true };
-    }
-
-    pub fn close(self: *SandboxMenu) void {
-        self.* = .{};
-    }
-
-    pub fn move(self: *SandboxMenu, delta: i32) bool {
-        const next = moveCompactSelection(self.active, self.selected_index, delta, sandbox_choices.len) orelse return false;
-        self.selected_index = next;
-        return true;
-    }
-
-    pub fn selectedChoice(self: *const SandboxMenu) ?SandboxChoice {
-        if (!self.active) return null;
-        return sandbox_choices[self.selected_index % sandbox_choices.len];
-    }
-
-    pub fn selectedChange(self: *const SandboxMenu) ?Change {
-        return (self.selectedChoice() orelse return null).change;
-    }
-
-    pub fn changeSelectedOption(self: *const SandboxMenu, snapshot: *const Snapshot, delta: i32) ?Change {
-        if (!self.active or delta == 0) return null;
-        return cycleChange(snapshot, .sandbox, delta);
-    }
-};
-
-pub fn sandboxChoiceCount() usize {
-    return sandbox_choices.len;
-}
-
-pub fn sandboxChoiceAt(index: usize) ?SandboxChoice {
-    if (index >= sandbox_choices.len) return null;
-    return sandbox_choices[index];
 }
 
 fn moveCompactSelection(active: bool, selected_index: usize, delta: i32, count: usize) ?usize {
@@ -441,7 +365,6 @@ pub const Menu = struct {
 const specs = [_]Spec{
     .{ .id = .input_appearance, .category = .interface, .label = "Input appearance", .description = "Choose the composer and submitted prompt presentation" },
     .{ .id = .maxxing_mode, .category = .interface, .label = "Maxxing mode", .description = "Choose minimal or legacy transcript presentation" },
-    .{ .id = .statusline_sandbox, .category = .interface, .label = "Status line sandbox", .description = "Show the active sandbox in the status line" },
     .{ .id = .statusline_context, .category = .interface, .label = "Status line context", .description = "Show context usage in the status line" },
     .{ .id = .statusline_session, .category = .interface, .label = "Status line session", .description = "Show the session title in the status line" },
     .{ .id = .statusline_workspace, .category = .interface, .label = "Status line workspace", .description = "Show the workspace path and Git branch in the status line" },
@@ -451,7 +374,6 @@ const specs = [_]Spec{
     .{ .id = .fast_mode, .category = .agent, .label = "Fast mode", .description = "Use faster inference when the model supports it" },
     .{ .id = .permission_mode, .category = .agent, .label = "Permission mode", .description = "Choose when Fx asks before taking actions" },
     .{ .id = .sound_level, .category = .notifications, .label = "Sound level", .description = "Choose off, on, or max sounds and terminal bells" },
-    .{ .id = .sandbox, .category = .advanced, .label = "Command sandbox", .description = "Choose command process isolation for this workspace" },
     .{ .id = .startup_scrollback, .category = .advanced, .label = "Startup scrollback", .description = "Restore terminal output when Fx starts" },
     .{ .id = .prompt_history, .category = .advanced, .label = "Prompt history", .description = "Save accepted prompts and slash commands for composer history" },
 };
@@ -463,7 +385,6 @@ const input_appearance_options = [_][]const u8{
 };
 const maxxing_options = [_][]const u8{ "minimal", "legacy" };
 const permission_options = [_][]const u8{ "ask", "auto", "yolo" };
-const sandbox_options = [_][]const u8{ "os", "none" };
 const sound_level_options = [_][]const u8{ "off", "on", "max" };
 
 pub fn filteredCount(snapshot: Snapshot, category: Category, query: []const u8) usize {
@@ -563,7 +484,6 @@ fn staticOptionsFor(id: SettingId) []const []const u8 {
     return switch (id) {
         .model, .effort => &.{},
         .fast_mode,
-        .statusline_sandbox,
         .statusline_context,
         .statusline_session,
         .statusline_workspace,
@@ -575,7 +495,6 @@ fn staticOptionsFor(id: SettingId) []const []const u8 {
         .permission_mode => &permission_options,
         .input_appearance => &input_appearance_options,
         .maxxing_mode => &maxxing_options,
-        .sandbox => &sandbox_options,
     };
 }
 
@@ -624,20 +543,18 @@ test "settings catalog projects grouped searchable preferences" {
         .permission_mode = "ask",
         .input_appearance = "tint",
         .maxxing_mode = "minimal",
-        .statusline_sandbox = false,
         .statusline_context = true,
         .statusline_workspace = false,
         .startup_scrollback = true,
         .prompt_history = true,
         .sound_level = "on",
-        .sandbox = "os",
     };
 
-    try std.testing.expectEqual(@as(usize, 15), filteredCount(snapshot, .all, ""));
-    try std.testing.expectEqual(@as(usize, 7), filteredCount(snapshot, .interface, ""));
+    try std.testing.expectEqual(@as(usize, 13), filteredCount(snapshot, .all, ""));
+    try std.testing.expectEqual(@as(usize, 6), filteredCount(snapshot, .interface, ""));
     try std.testing.expectEqual(@as(usize, 4), filteredCount(snapshot, .agent, ""));
     try std.testing.expectEqual(@as(usize, 1), filteredCount(snapshot, .notifications, ""));
-    try std.testing.expectEqual(@as(usize, 3), filteredCount(snapshot, .advanced, ""));
+    try std.testing.expectEqual(@as(usize, 2), filteredCount(snapshot, .advanced, ""));
 
     const current_model = itemAt(snapshot, .all, "glm 5.2", 0).?;
     try std.testing.expectEqual(SettingId.model, current_model.id);
@@ -663,12 +580,10 @@ test "settings catalog returns typed edit choices without effects" {
         .permission_mode = "ask",
         .input_appearance = "tint",
         .maxxing_mode = "minimal",
-        .statusline_sandbox = false,
         .statusline_context = true,
         .startup_scrollback = true,
         .prompt_history = true,
         .sound_level = "on",
-        .sandbox = "os",
     };
 
     try std.testing.expectEqual(@as(usize, 2), optionCount(&snapshot, .input_appearance));
@@ -713,12 +628,10 @@ test "settings menu navigates rows and changes selected values inline" {
         .permission_mode = "ask",
         .input_appearance = "tint",
         .maxxing_mode = "minimal",
-        .statusline_sandbox = false,
         .statusline_context = true,
         .startup_scrollback = true,
         .prompt_history = true,
         .sound_level = "on",
-        .sandbox = "os",
     };
 
     var menu: Menu = .{};
@@ -798,49 +711,28 @@ test "status line menu describes toggle changes without performing effects" {
     menu.open();
 
     const disabled: Snapshot = .{
-        .statusline_sandbox = false,
         .statusline_context = false,
         .statusline_workspace = false,
     };
-    const enable_sandbox = menu.selectedChange(disabled).?;
-    try std.testing.expectEqual(SettingId.statusline_sandbox, enable_sandbox.setting);
-    try std.testing.expectEqualStrings("on", enable_sandbox.value);
+    const enable_context = menu.selectedChange(disabled).?;
+    try std.testing.expectEqual(SettingId.statusline_context, enable_context.setting);
+    try std.testing.expectEqualStrings("on", enable_context.value);
 
     const enabled: Snapshot = .{
-        .statusline_sandbox = true,
-        .statusline_context = false,
+        .statusline_context = true,
     };
     try std.testing.expectEqualStrings("off", menu.selectedChange(enabled).?.value);
 
     try std.testing.expect(menu.move(1));
-    const enable_context = menu.selectedChange(enabled).?;
-    try std.testing.expectEqual(SettingId.statusline_context, enable_context.setting);
-    try std.testing.expectEqualStrings("on", enable_context.value);
+    const enable_session = menu.selectedChange(enabled).?;
+    try std.testing.expectEqual(SettingId.statusline_session, enable_session.setting);
+    try std.testing.expectEqualStrings("on", enable_session.value);
 
-    try std.testing.expect(menu.move(2));
+    try std.testing.expect(menu.move(1));
     const enable_workspace = menu.selectedChange(enabled).?;
     try std.testing.expectEqual(SettingId.statusline_workspace, enable_workspace.setting);
     try std.testing.expectEqualStrings("on", enable_workspace.value);
 
     menu.close();
     try std.testing.expect(menu.selectedChange(enabled) == null);
-}
-
-test "sandbox menu returns the selected explicit mode" {
-    const snapshot: Snapshot = .{ .sandbox = "none" };
-    var menu: SandboxMenu = .{};
-    menu.open();
-
-    const os_choice = menu.selectedChoice().?;
-    try std.testing.expectEqualStrings("OS sandbox", os_choice.label);
-    try std.testing.expect(!os_choice.isCurrent(snapshot));
-    try std.testing.expectEqualStrings("os", menu.selectedChange().?.value);
-
-    try std.testing.expect(menu.move(1));
-    const none_choice = menu.selectedChoice().?;
-    try std.testing.expect(none_choice.isCurrent(snapshot));
-    try std.testing.expectEqualStrings("none", menu.selectedChange().?.value);
-
-    menu.close();
-    try std.testing.expect(menu.selectedChange() == null);
 }

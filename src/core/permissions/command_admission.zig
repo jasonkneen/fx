@@ -9,30 +9,24 @@ pub const CommandContext = struct {
     command: []const u8,
     resolved_cwd: []const u8,
     background: bool,
-    resolved_backend: types.BackendKind,
     target_os: std.Target.Os.Tag,
     environment: command_environment.Environment = .legacy,
-    scope: auto_classifier.SandboxScope = .restricted,
 };
 
 pub const AdmissionFingerprint = struct {
     command: []const u8,
     resolved_cwd: []const u8,
     background: bool,
-    resolved_backend: types.BackendKind,
     target_os: std.Target.Os.Tag,
     environment: command_environment.Environment = .legacy,
-    scope: auto_classifier.SandboxScope,
 
     pub fn init(ctx: CommandContext) AdmissionFingerprint {
         return .{
             .command = ctx.command,
             .resolved_cwd = ctx.resolved_cwd,
             .background = ctx.background,
-            .resolved_backend = ctx.resolved_backend,
             .target_os = ctx.target_os,
             .environment = ctx.environment,
-            .scope = ctx.scope,
         };
     }
 
@@ -40,10 +34,8 @@ pub const AdmissionFingerprint = struct {
         return std.mem.eql(u8, self.command, ctx.command) and
             std.mem.eql(u8, self.resolved_cwd, ctx.resolved_cwd) and
             self.background == ctx.background and
-            self.resolved_backend == ctx.resolved_backend and
             self.target_os == ctx.target_os and
-            self.environment.eql(ctx.environment) and
-            self.scope == ctx.scope;
+            self.environment.eql(ctx.environment);
     }
 
     pub fn eql(self: AdmissionFingerprint, other: AdmissionFingerprint) bool {
@@ -51,10 +43,8 @@ pub const AdmissionFingerprint = struct {
             .command = other.command,
             .resolved_cwd = other.resolved_cwd,
             .background = other.background,
-            .resolved_backend = other.resolved_backend,
             .target_os = other.target_os,
             .environment = other.environment,
-            .scope = other.scope,
         });
     }
 };
@@ -68,7 +58,7 @@ pub const ShellAuthorizationSource = enum {
     auto_mode,
     auto_classifier,
     yolo,
-    js_host_workspace_sandbox,
+    js_host,
 };
 
 pub const CommandExecutionAuthority = union(enum) {
@@ -117,7 +107,6 @@ pub const PermissionOutcome = struct {
 pub const PermissionRequirement = enum {
     configured_rule,
     approval_required,
-    sandbox_widening,
 };
 
 pub const DefaultApproval = union(enum) {
@@ -143,7 +132,6 @@ pub fn defaultForRunCommand(
         command_ctx.command,
         command_ctx.resolved_cwd,
         command_ctx.background,
-        command_ctx.resolved_backend,
         command_ctx.target_os,
     ) catch return .{ .approval_required = .planning_failure };
     defer admission.deinit(alloc);
@@ -159,7 +147,6 @@ test "normalized default emits direct-only only for a direct plan" {
         .command = "pwd",
         .resolved_cwd = "/workspace",
         .background = false,
-        .resolved_backend = .none,
         .target_os = .macos,
     };
     const direct = defaultForRunCommand(std.testing.allocator, direct_ctx, .ask);
@@ -172,7 +159,6 @@ test "normalized default emits direct-only only for a direct plan" {
         .command = "touch created.txt",
         .resolved_cwd = "/workspace",
         .background = false,
-        .resolved_backend = .none,
         .target_os = .macos,
     };
     try std.testing.expectEqual(
@@ -186,7 +172,6 @@ test "explicit user environment always requires shell authority" {
         .command = "pwd",
         .resolved_cwd = "/workspace",
         .background = false,
-        .resolved_backend = .none,
         .target_os = .macos,
         .environment = .{ .user = "/bin/zsh" },
     };
@@ -203,7 +188,6 @@ test "explicit clean environment is direct only in automatic mode" {
         .command = "pwd",
         .resolved_cwd = "/workspace",
         .background = false,
-        .resolved_backend = .none,
         .target_os = .macos,
         .environment = .{ .clean = "/bin/zsh" },
     };

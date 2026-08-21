@@ -13,7 +13,6 @@ const debug_trace = @import("../shared/debug_trace.zig");
 const record_tape = @import("../workspace/record_tape.zig");
 const workspace_access = @import("../workspace/workspace_access.zig");
 const update_target = @import("../upgrade/update_target.zig");
-const sandbox = @import("../permissions/sandbox.zig");
 const notification_sound = @import("../notifications/sound.zig");
 const tool_result_limits = @import("../tooling/tool_result_limits.zig");
 const types = @import("../shared/types.zig");
@@ -145,8 +144,6 @@ pub const StartupState = struct {
     config_diagnostics: []config_runtime.ConfigDiagnostic = &.{},
     effort: types.ReasoningEffort = .auto,
     first_call_tool_choice: types.ToolChoice = .auto,
-    sandbox_backend: sandbox.BackendKind = .none,
-    statusline_sandbox: bool = false,
     statusline_context: bool = false,
     statusline_session: bool = false,
     statusline_workspace: bool = false,
@@ -223,7 +220,6 @@ pub const StartupStatus = struct {
     owned_selected_model: ?[]u8 = null,
     auth: auth_runtime.StatusSnapshot = .{},
     permission_mode: PermissionMode,
-    sandbox_backend: sandbox.BackendKind = .none,
     agent_step_limit: usize,
     update_channel: update_target.Channel = .stable,
     config_diagnostics: []config_runtime.ConfigDiagnostic = &.{},
@@ -340,7 +336,6 @@ pub fn loadStartupStatus(
         .owned_selected_model = selected_model.owned,
         .auth = auth_status,
         .permission_mode = loadPermissionMode(settings.permission_mode),
-        .sandbox_backend = sandbox.backendFromConfig(settings.sandbox),
         .agent_step_limit = loadAgentStepLimit(default_agent_step_limit, settings.max_agent_steps),
         .update_channel = settings.update_channel orelse .stable,
         .config_diagnostics = detailed.diagnostics,
@@ -439,8 +434,6 @@ fn loadStartupStateFromOwnedWorkspace(
     state.startup_scrollback = settings.startup_scrollback orelse true;
     state.effort = settings.effort orelse .auto;
     state.first_call_tool_choice = settings.first_call_tool_choice orelse .auto;
-    state.sandbox_backend = sandbox.backendFromConfig(settings.sandbox);
-    state.statusline_sandbox = settings.statusline_sandbox orelse false;
     state.statusline_context = settings.statusline_context orelse false;
     state.statusline_session = settings.statusline_session orelse false;
     state.statusline_workspace = settings.statusline_workspace orelse false;
@@ -1122,6 +1115,7 @@ fn configuredProviderSelection(
     const model = switch (provider) {
         .gateway => settings.model orelse default_model,
         .codex => settings.codex_model orelse return error.CodexModelNotSelected,
+        .grok => settings.grok_model orelse return error.GrokModelNotSelected,
     };
     return .{ .provider = provider, .model = model };
 }
@@ -1156,6 +1150,14 @@ test "startup provider chooses only its provider-scoped model" {
         error.CodexModelNotSelected,
         configuredProviderSelection("default/model", &missing_codex),
     );
+
+    const grok_settings = config_runtime.Settings{
+        .provider = .grok,
+        .grok_model = @constCast("grok-model"),
+    };
+    const grok = try configuredProviderSelection("default/model", &grok_settings);
+    try std.testing.expectEqual(model_provider.ProviderId.grok, grok.provider);
+    try std.testing.expectEqualStrings("grok-model", grok.model);
 }
 
 fn loadInitialModel(alloc: Allocator, default_model: []const u8, configured: ?[]const u8) ![]u8 {
@@ -2038,7 +2040,6 @@ test "loadStartupState applies core env overrides" {
     try std.testing.expectEqual(credentials.Source.ai_gateway_api_key, state.credential.?.source);
     try std.testing.expectEqual(PermissionMode.auto, state.permission_mode);
     try std.testing.expectEqual(@as(usize, 37), state.agent_step_limit);
-    try std.testing.expectEqual(sandbox.BackendKind.auto, state.sandbox_backend);
 }
 
 test "loadStartupState defaults fast mode off and preserves explicit preferences" {

@@ -93,6 +93,7 @@ pub const CredentialSource = enum {
     fx_login,
     stored_key,
     chatgpt_subscription,
+    grok_subscription,
 };
 
 pub fn parseCredentialSource(text: []const u8) ?CredentialSource {
@@ -1520,34 +1521,6 @@ pub const RuleDecision = enum {
 };
 
 pub const ContentHash = [std.crypto.hash.sha2.Sha256.digest_length]u8;
-
-pub const BackendKind = enum {
-    macos,
-    vercel,
-    just_bash,
-    none,
-    auto,
-
-    pub fn parse(raw: []const u8) ?BackendKind {
-        const trimmed = std.mem.trim(u8, raw, " \t\r\n");
-        if (std.ascii.eqlIgnoreCase(trimmed, "macos")) return .macos;
-        if (std.ascii.eqlIgnoreCase(trimmed, "vercel")) return .vercel;
-        if (std.ascii.eqlIgnoreCase(trimmed, "just-bash")) return .just_bash;
-        if (std.ascii.eqlIgnoreCase(trimmed, "none")) return .none;
-        if (std.ascii.eqlIgnoreCase(trimmed, "auto")) return .auto;
-        return null;
-    }
-
-    pub fn label(self: BackendKind) []const u8 {
-        return switch (self) {
-            .macos => "macos",
-            .vercel => "vercel",
-            .just_bash => "just-bash",
-            .none => "none",
-            .auto => "auto",
-        };
-    }
-};
 
 pub const ToolChoice = enum {
     auto,

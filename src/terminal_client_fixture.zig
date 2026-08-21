@@ -11,7 +11,7 @@ const io_mod = @import("core/shared/io.zig");
 const operation = @import("core/terminal/operation.zig");
 const policy = @import("core/terminal/host_policy.zig");
 const profile_paths = @import("core/shared/profile_paths.zig");
-const sandbox = @import("core/permissions/sandbox.zig");
+const command_runner = @import("core/execution/command_runner.zig");
 const session_child_store = @import("core/session/session_child_store.zig");
 const store = @import("core/terminal/store.zig");
 const native_session = @import("core/terminal/native_session.zig");
@@ -90,8 +90,8 @@ fn mainInner(
         cli_arg_buffer[index] = std.mem.sliceTo(arg, 0);
     }
     const cli_args = cli_arg_buffer[0 .. args.len - 1];
-    if (sandbox.isForegroundSessionInvocation(cli_args)) {
-        return sandbox.runForegroundSessionBootstrap(cli_args);
+    if (command_runner.isForegroundSessionInvocation(cli_args)) {
+        return command_runner.runForegroundSessionBootstrap(cli_args);
     }
     try runFixture(process_allocator, background_process.provider);
 }
@@ -252,7 +252,6 @@ fn fixturePreparation(home: []const u8) operation.AuthorityPreparation {
         .workspace_root = home,
         .cwd = home,
         .transport_role = .interactive,
-        .sandbox_backend = .none,
         .backend = .native,
         .actor = .agent,
         .controls = .full(),
@@ -268,7 +267,6 @@ fn fixturePrincipal(home: []const u8) contracts.Principal {
         .workspace_root = input.workspace_root,
         .cwd = input.cwd,
         .transport_role = input.transport_role,
-        .sandbox_backend = input.sandbox_backend,
         .backend = input.backend,
         .lifetime = input.lifetime,
     };

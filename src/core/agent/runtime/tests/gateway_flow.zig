@@ -2333,7 +2333,7 @@ test "processQueuedPrompt never uses the vision fallback for Codex" {
     job.authorized_image_catalog = &images;
 
     try std.testing.expectError(
-        error.CodexNativeImageUnavailable,
+        error.SubscriptionNativeImageUnavailable,
         runFakePrompt(&gateway, &hooks, fixture.config(), job),
     );
     try std.testing.expectEqual(@as(usize, 0), gateway.request_bodies.items.len);

@@ -29,6 +29,7 @@ pub fn streamGatewayCompletion(
     alloc: Allocator,
     api_key: []const u8,
     credential_source: ?types.CredentialSource,
+    account_id: ?[]const u8,
     team: ?[]const u8,
     session_id: ?[]const u8,
     model: []const u8,
@@ -57,6 +58,7 @@ pub fn streamGatewayCompletion(
     var result = provider.stream(alloc, .{
         .api_key = api_key,
         .credential_source = credential_source,
+        .account_id = account_id,
         .team = team,
         .session_id = session_id,
         .model = model,
@@ -105,7 +107,7 @@ pub fn streamGatewayCompletion(
     if (comptime @import("builtin").os.tag != .wasi) {
         if (result.reconcile_generation_usage) {
             if (usage) |ledger| {
-                if (credential_source == .chatgpt_subscription) {
+                if (credential_source == .chatgpt_subscription or credential_source == .grok_subscription) {
                     ledger.clearReconciliationCredential();
                 } else {
                     ledger.startReconciliation(usage_allocator, api_key);
@@ -357,6 +359,7 @@ test "pre-send gateway failure settles usage as unbilled" {
         null,
         null,
         null,
+        null,
         "test/model",
         1,
         "not a valid URL",
@@ -412,6 +415,7 @@ test "possibly sent gateway failure marks billing incomplete" {
         .{ .stream_fn = Gateway.stream },
         alloc,
         "test-key",
+        null,
         null,
         null,
         null,

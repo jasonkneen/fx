@@ -627,7 +627,7 @@ pub const TurnContext = struct {
     }
 
     /// Returns an owned current authority snapshot. Normal-agent permission,
-    /// availability, sandbox, and integration adapters call this for every
+    /// availability and integration adapters call this for every
     /// child tool action rather than retaining the admission-time copy.
     pub fn resolveLiveAuthority(
         self: *TurnContext,
@@ -738,7 +738,6 @@ pub const TurnContext = struct {
                 .generation = snapshot.generation,
                 .root_id = snapshot.root_id,
                 .tools = snapshot.tools,
-                .sandbox_backend = snapshot.sandbox_backend,
                 .integrations = snapshot.integrations,
                 .rules = snapshot.rules,
                 .grants = snapshot.grants,
@@ -3914,7 +3913,6 @@ test "admission snapshot is isolated owned and preserves configured permission m
         .model = "test/model",
         .effort = types.ReasoningEffort.literal("high"),
         .permission_mode = .ask,
-        .sandbox_backend = .macos,
         .tool_names = &.{ "read_file", "write_file" },
         .rules = .{ .rules = &rules },
         .grants = &grants,
@@ -4197,7 +4195,6 @@ const Observation = struct {
     content: []u8,
     model: []u8,
     effort: types.ReasoningEffort,
-    sandbox_backend: types.BackendKind,
     tool_name: []u8,
     rule_pattern: []u8,
     grant_target: []u8,
@@ -4263,7 +4260,6 @@ const FakeExecution = struct {
             .source_id = request.source_id,
             .model = request.preferences.model,
             .effort = request.preferences.effort,
-            .sandbox_backend = if (current == 0) .macos else .vercel,
             .tool_names = if (current == 0) &.{"read_file"} else &.{"write_file"},
             .rules = .{ .rules = &rules },
             .grants = &grants,
@@ -4384,7 +4380,6 @@ const ApprovalBlockingExecution = struct {
             .source_id = request.source_id,
             .model = request.preferences.model,
             .effort = request.preferences.effort,
-            .sandbox_backend = .none,
             .tool_names = &.{"create_folder"},
             .rules = .{ .rules = &.{} },
             .grants = &.{},
@@ -4466,7 +4461,6 @@ fn makeObservation(
         .content = owned_content,
         .model = model,
         .effort = admission.effort,
-        .sandbox_backend = admission.sandbox_backend,
         .tool_name = tool_name,
         .rule_pattern = rule_pattern,
         .grant_target = grant_target,
@@ -5788,13 +5782,11 @@ test "authority snapshots isolate siblings and refresh only at turn admission" {
     const first = findObservation(fake.observations.items, "authority-a", "a-old").?;
     const second = findObservation(fake.observations.items, "authority-a", "a-new").?;
     const sibling = findObservation(fake.observations.items, "authority-b", "b-new").?;
-    try std.testing.expectEqual(types.BackendKind.macos, first.sandbox_backend);
     try std.testing.expectEqualStrings("read_file", first.tool_name);
     try std.testing.expectEqualStrings("old.txt", first.rule_pattern);
     try std.testing.expectEqualStrings("/tmp/old.txt", first.grant_target);
     try std.testing.expectEqualStrings("mcp:old", first.integration_name);
     for ([_]Observation{ second, sibling }) |observation| {
-        try std.testing.expectEqual(types.BackendKind.vercel, observation.sandbox_backend);
         try std.testing.expectEqualStrings("write_file", observation.tool_name);
         try std.testing.expectEqualStrings("new.txt", observation.rule_pattern);
         try std.testing.expectEqualStrings("/tmp/new.txt", observation.grant_target);
@@ -6563,7 +6555,6 @@ test "canonical approval wait refreshes revoked authority and races reject relat
             return .{
                 .generation = if (revoked) 2 else 1,
                 .tools = tools,
-                .sandbox_backend = if (revoked) .none else .macos,
                 .integrations = integrations,
                 .rules = .{ .rules = rules },
                 .grants = grants,
@@ -6668,7 +6659,6 @@ test "canonical approval wait refreshes revoked authority and races reject relat
         .worker = &turn.worker,
         .permission_prompter = turn.permissionPrompter(),
         .background = &background,
-        .sandbox_backend = .macos,
         .advertised_dynamic_tool_names = &.{},
         .mcp_runtime = .{},
     }, .start = &registration_start, .ready = &registration_ready };
@@ -6818,7 +6808,6 @@ test "canonical approval wait refreshes revoked authority and races reject relat
     try std.testing.expectEqual(runtime_deps.LiveToolAuthorityDecision.unavailable, refreshed.decision);
     try std.testing.expect(refreshed.authority.generation != initial_authority_generation);
     try std.testing.expectEqual(@as(usize, 0), refreshed.authority.tools.len);
-    try std.testing.expectEqual(types.BackendKind.none, refreshed.authority.sandbox_backend);
     var resumed = try env.loadControl(alloc, "approval-child");
     defer resumed.deinit(alloc);
     try std.testing.expectEqual(domain.State.running, resumed.state);
@@ -6898,7 +6887,6 @@ const ToolEffectExecution = struct {
             .source_id = request.source_id,
             .model = request.preferences.model,
             .effort = request.preferences.effort,
-            .sandbox_backend = .none,
             .tool_names = &.{"create_folder"},
         }) catch |err| return switch (err) {
             error.OutOfMemory => error.OutOfMemory,
@@ -6975,7 +6963,6 @@ const ToolEffectAuthority = struct {
         return .{
             .generation = 1,
             .tools = tools,
-            .sandbox_backend = .none,
             .integrations = integrations,
             .rules = .{ .rules = rules },
             .grants = grants,
@@ -7408,7 +7395,6 @@ const ProcessBoundaryExecution = struct {
             .source_id = request.source_id,
             .model = request.preferences.model,
             .effort = request.preferences.effort,
-            .sandbox_backend = .none,
         }) catch |err| return switch (err) {
             error.OutOfMemory => error.OutOfMemory,
             else => error.AdmissionFailed,
@@ -8002,10 +7988,6 @@ const LiveRevalidationHost = struct {
     tool_name: []const u8,
     source_pattern: ?[]const u8 = null,
     destination_pattern: ?[]const u8 = null,
-    sandbox_command: ?[]const u8 = null,
-    command_action: types.PermissionAction = .allow,
-    changed_command_action: ?types.PermissionAction = null,
-    initial_sandbox_grant: bool = false,
 
     fn action(code: u8) ?types.PermissionAction {
         return switch (code) {
@@ -8036,15 +8018,8 @@ const LiveRevalidationHost = struct {
             null
         else
             action(self.changed_action.load(.seq_cst));
-        const command_action = if (generation == 1)
-            self.command_action
-        else
-            self.changed_command_action orelse self.command_action;
-        const rule_count: usize = if (self.sandbox_command != null)
-            1 + @as(usize, @intFromBool(changed_action != null))
-        else
-            @as(usize, @intFromBool(self.source_pattern != null)) +
-                @as(usize, @intFromBool(changed_action != null));
+        const rule_count: usize = @as(usize, @intFromBool(self.source_pattern != null)) +
+            @as(usize, @intFromBool(changed_action != null));
         const rules = try alloc.alloc(types.PermissionRule, rule_count);
         errdefer alloc.free(rules);
         var initialized: usize = 0;
@@ -8053,60 +8028,34 @@ const LiveRevalidationHost = struct {
             alloc.free(rule.pattern);
         };
 
-        if (self.sandbox_command != null) {
+        if (self.source_pattern) |source| {
             rules[initialized] = try ownLiveRevalidationRule(
                 alloc,
-                "bash",
-                "*",
-                command_action,
+                self.tool_name,
+                source,
+                .allow,
             );
             initialized += 1;
-            if (changed_action) |value| {
-                rules[initialized] = try ownLiveRevalidationRule(
-                    alloc,
-                    "sandbox",
-                    self.sandbox_command.?,
-                    value,
-                );
-                initialized += 1;
-            }
-        } else {
-            if (self.source_pattern) |source| {
-                rules[initialized] = try ownLiveRevalidationRule(
-                    alloc,
-                    self.tool_name,
-                    source,
-                    .allow,
-                );
-                initialized += 1;
-            }
-            if (changed_action) |value| {
-                rules[initialized] = try ownLiveRevalidationRule(
-                    alloc,
-                    self.tool_name,
-                    self.destination_pattern.?,
-                    value,
-                );
-                initialized += 1;
-            }
+        }
+        if (changed_action) |value| {
+            rules[initialized] = try ownLiveRevalidationRule(
+                alloc,
+                self.tool_name,
+                self.destination_pattern.?,
+                value,
+            );
+            initialized += 1;
         }
 
         const tools = try cloneTestStrings(alloc, &.{self.tool_name});
         errdefer freeTestStrings(alloc, tools);
         const integrations = try alloc.alloc([]u8, 0);
         errdefer alloc.free(integrations);
-        const grants = if (self.initial_sandbox_grant and generation == 1)
-            try types.dupePermissionGrantSlice(alloc, &.{.{
-                .tool_name = @constCast("sandbox"),
-                .target_path = @constCast(self.sandbox_command.?),
-            }})
-        else
-            try alloc.alloc(types.PermissionGrant, 0);
+        const grants = try alloc.alloc(types.PermissionGrant, 0);
         errdefer types.freePermissionGrantSlice(alloc, grants);
         return .{
             .generation = generation,
             .tools = tools,
-            .sandbox_backend = .macos,
             .integrations = integrations,
             .rules = .{ .rules = rules },
             .grants = grants,
@@ -8135,7 +8084,6 @@ const ProductionPermissionAdapter = struct {
             .worker = &self.turn.worker,
             .permission_prompter = self.turn.permissionPrompter(),
             .background = self.background,
-            .sandbox_backend = authority.sandbox_backend,
             .advertised_dynamic_tool_names = &.{},
             .mcp_runtime = .{},
         };
@@ -8164,44 +8112,12 @@ const ProductionPermissionAdapter = struct {
                 action_request.authority,
                 action_request.human_approval,
             ),
-            .sandbox_widening => |widening| tooling_tool_admission.revalidateLiveSandboxWideningOutcome(
-                admission,
-                arena,
-                call,
-                permission_mode,
-                local_grants,
-                widening.authority,
-                widening.required.wideningInput(),
-                widening.human_approval,
-            ),
         } else tooling_tool_admission.requestPermissionOutcome(
             admission,
             arena,
             call,
             permission_mode,
             local_grants,
-        );
-    }
-
-    fn requestSandboxWidening(
-        raw: *anyopaque,
-        arena: Allocator,
-        call: types.ToolCall,
-        review_turn: permission_auto_classifier.ReviewTurnContext,
-        permission_mode: types.PermissionMode,
-        local_grants: []const types.PermissionGrant,
-        live_authority: ?agent_runtime.LiveToolAuthority,
-        _: []const []const u8,
-        required: agent_runtime.SandboxScopeRequired,
-    ) !command_admission.PermissionOutcome {
-        const self: *@This() = @ptrCast(@alignCast(raw));
-        return tooling_tool_admission.requestSandboxWideningOutcome(
-            try self.input(review_turn, live_authority),
-            arena,
-            call,
-            permission_mode,
-            local_grants,
-            required.wideningInput(),
         );
     }
 };
@@ -8531,411 +8447,6 @@ test "production child action revalidation checks changed copy and rename destin
     }
 }
 
-fn runProductionSandboxGenerationCase(
-    changed_action: types.PermissionAction,
-    approval_decision: types.ToolPermissionDecision,
-) !void {
-    const alloc = std.testing.allocator;
-    var env = try TestEnvironment.init(alloc);
-    defer env.deinit(alloc);
-    try env.createSession(alloc, "parent");
-    try env.createSession(alloc, "sandbox-child");
-    try env.installControl(
-        alloc,
-        "sandbox-child",
-        .persistent,
-        "model/sandbox",
-        types.ReasoningEffort.literal("medium"),
-        &.{"sandbox-work"},
-    );
-    try env.setPermissionMode(alloc, "sandbox-child", .ask);
-    {
-        var capability = try env.store.openSubagentControlCapabilityWritable(
-            alloc,
-            "sandbox-child",
-            .{},
-        );
-        defer capability.deinit();
-        const store = control_store.Store{
-            .capability = &capability,
-            .expected_child_id = "sandbox-child",
-        };
-        var lock = try store.acquireLock();
-        defer lock.release();
-        var record = try store.load(alloc);
-        defer record.deinit(alloc);
-        try admitWork(alloc, &record, 0, 2);
-        try store.save(alloc, record);
-    }
-
-    var host = LiveRevalidationHost{
-        .tool_name = "terminal",
-        .sandbox_command = "npm test",
-    };
-    var login_shell_buffer: [4096]u8 = undefined;
-    const login_shell = shell_resolver.configuredLoginShellInto(&login_shell_buffer) orelse
-        return error.SkipZigTest;
-    var authority = authority_mod.Resolver{
-        .sessions = &env.store,
-        .host = .{ .context = &host, .resolve_fn = LiveRevalidationHost.resolve },
-    };
-    var durable = approval_persistence.DurableRegistry{
-        .alloc = alloc,
-        .sessions = &env.store,
-    };
-    var registry = approval_registry_mod.Registry{
-        .alloc = alloc,
-        .persistence = durable.interface(),
-    };
-    defer registry.deinit();
-    var loaded = try env.store.resumeForWrite(alloc, "sandbox-child");
-    defer {
-        loaded.log.park();
-        loaded.deinit(alloc);
-    }
-    var turn = try TurnContext.init(alloc, &loaded, 8);
-    defer turn.deinit();
-    turn.live_authority = &authority;
-    turn.approval_registry = &registry;
-    turn.child_id = "sandbox-child";
-    turn.active_work_id = "sandbox-work";
-    turn.worker.worker_processing = true;
-    var background: background_runtime.BackgroundRuntime = .{};
-    defer background.deinit(alloc);
-    var hooks = agent_test_support.FakeAgentRuntimeDeps.init(alloc);
-    defer hooks.deinit();
-    hooks.live_tool_authority = turn.liveToolAuthorityProvider();
-    hooks.permission_target = env.workspace;
-    hooks.workspace_root = env.workspace;
-    hooks.exec_plans = &.{
-        .{ .result = .{
-            .status = .failure,
-            .model_output = "",
-            .sandbox_scope_required = .{
-                .phase = .preflight,
-                .restricted_fingerprint = .{
-                    .command = "npm test",
-                    .resolved_cwd = env.workspace,
-                    .background = false,
-                    .resolved_backend = .macos,
-                    .target_os = builtin.os.tag,
-                    .environment = .{ .user = login_shell },
-                    .scope = .restricted,
-                },
-            },
-        } },
-        .{ .result = .{ .model_output = "broader effect" } },
-    };
-    var adapter = ProductionPermissionAdapter{
-        .turn = &turn,
-        .background = &background,
-        .workspace_root = env.workspace,
-        .tool_registry = hooks.tool_registry,
-    };
-    hooks.permission_request_override = .{
-        .context = &adapter,
-        .request_fn = ProductionPermissionAdapter.requestPermission,
-    };
-    hooks.sandbox_widening_request_override = .{
-        .context = &adapter,
-        .request_fn = ProductionPermissionAdapter.requestSandboxWidening,
-    };
-
-    const calls = [_]types.ToolCall{.{
-        .id = "generation-bound-sandbox",
-        .name = "terminal",
-        .arguments_json = "{\"action\":\"exec\",\"command\":\"npm test\"}",
-    }};
-    const completions = [_]agent_test_support.FakeCompletion{
-        .{ .tool_calls = &calls },
-        .{ .content = "done" },
-    };
-    var gateway = agent_test_support.FakeGateway.init(alloc, &completions);
-    defer gateway.deinit();
-    var fixture = agent_test_support.PromptFixture{ .workspace_root = env.workspace };
-    var job = fixture.job();
-    // This fixture exercises human-approved sandbox revalidation. Keep it in
-    // ask mode so automatic recovery does not intentionally bypass the prompt.
-    job.permission_mode = .ask;
-    var config = fixture.config();
-    config.origin = .subagent;
-    config.session_child_capability = try turn.childCapability();
-    var prompt = ProductionPromptThread{
-        .gateway = &gateway,
-        .hooks = &hooks,
-        .config = config,
-        .job = job,
-    };
-    const thread = try std.Thread.spawn(.{}, ProductionPromptThread.run, .{&prompt});
-    var joined = false;
-    defer if (!joined) {
-        turn.worker.requestCancel();
-        thread.join();
-    };
-    const approval_id = try waitForPendingToolApproval(alloc, &env, "sandbox-child");
-    defer alloc.free(approval_id);
-    try std.testing.expectEqual(
-        @as(usize, 0),
-        hooks.successful_effect_count.load(.seq_cst),
-    );
-    host.change(changed_action);
-    try std.testing.expectEqual(
-        approval_registry_mod.ResolveResult.accepted,
-        try registry.resolve(
-            approval_id,
-            "sandbox-child",
-            approval_decision,
-            null,
-            3,
-        ),
-    );
-    thread.join();
-    joined = true;
-    try std.testing.expect(!prompt.failed.load(.seq_cst));
-    const expected_effects: usize = if (changed_action == .ask) 1 else 0;
-    try std.testing.expectEqual(
-        expected_effects,
-        hooks.successful_effect_count.load(.seq_cst),
-    );
-    var ledger = try env.loadCommunication(alloc, "sandbox-child");
-    defer ledger.deinit(alloc);
-    try std.testing.expectEqual(@as(usize, 1), ledger.approvals.len);
-    try std.testing.expectEqual(
-        if (approval_decision == .always)
-            communication.ApprovalStatus.allowed_always
-        else
-            communication.ApprovalStatus.allowed_once,
-        ledger.approvals[0].status,
-    );
-}
-
-test "production child sandbox revalidation checks changed widening rules" {
-    try runProductionSandboxGenerationCase(.ask, .always);
-    try runProductionSandboxGenerationCase(.deny, .once);
-}
-
-test "production child sandbox grant revocation requires a separate widening approval" {
-    const alloc = std.testing.allocator;
-    var env = try TestEnvironment.init(alloc);
-    defer env.deinit(alloc);
-    try env.createSession(alloc, "parent");
-    try env.createSession(alloc, "grant-child");
-    try env.installControl(
-        alloc,
-        "grant-child",
-        .persistent,
-        "model/grant",
-        types.ReasoningEffort.literal("medium"),
-        &.{"grant-work"},
-    );
-    try env.setPermissionMode(alloc, "grant-child", .auto);
-    {
-        var capability = try env.store.openSubagentControlCapabilityWritable(
-            alloc,
-            "grant-child",
-            .{},
-        );
-        defer capability.deinit();
-        const store = control_store.Store{
-            .capability = &capability,
-            .expected_child_id = "grant-child",
-        };
-        var lock = try store.acquireLock();
-        defer lock.release();
-        var record = try store.load(alloc);
-        defer record.deinit(alloc);
-        try admitWork(alloc, &record, 0, 2);
-        try store.save(alloc, record);
-    }
-
-    var host = LiveRevalidationHost{
-        .tool_name = "terminal",
-        .sandbox_command = "npm test",
-        .command_action = .ask,
-        .changed_command_action = .allow,
-        .initial_sandbox_grant = true,
-    };
-    var login_shell_buffer: [4096]u8 = undefined;
-    const login_shell = shell_resolver.configuredLoginShellInto(&login_shell_buffer) orelse
-        return error.SkipZigTest;
-    var authority = authority_mod.Resolver{
-        .sessions = &env.store,
-        .host = .{ .context = &host, .resolve_fn = LiveRevalidationHost.resolve },
-    };
-    var durable = ObservedDurableApprovalRegistry{
-        .durable = .{
-            .alloc = alloc,
-            .sessions = &env.store,
-        },
-    };
-    var registry = approval_registry_mod.Registry{
-        .alloc = alloc,
-        .persistence = durable.interface(),
-    };
-    defer registry.deinit();
-    var loaded = try env.store.resumeForWrite(alloc, "grant-child");
-    defer {
-        loaded.log.park();
-        loaded.deinit(alloc);
-    }
-    var turn = try TurnContext.init(alloc, &loaded, 8);
-    defer turn.deinit();
-    turn.live_authority = &authority;
-    turn.approval_registry = &registry;
-    turn.child_id = "grant-child";
-    turn.active_work_id = "grant-work";
-    turn.worker.worker_processing = true;
-    var background: background_runtime.BackgroundRuntime = .{};
-    defer background.deinit(alloc);
-    var hooks = agent_test_support.FakeAgentRuntimeDeps.init(alloc);
-    defer hooks.deinit();
-    hooks.live_tool_authority = turn.liveToolAuthorityProvider();
-    hooks.permission_target = env.workspace;
-    hooks.workspace_root = env.workspace;
-    hooks.exec_plans = &.{
-        .{ .result = .{
-            .status = .failure,
-            .model_output = "",
-            .sandbox_scope_required = .{
-                .phase = .preflight,
-                .restricted_fingerprint = .{
-                    .command = "npm test",
-                    .resolved_cwd = env.workspace,
-                    .background = false,
-                    .resolved_backend = .macos,
-                    .target_os = builtin.os.tag,
-                    .environment = .{ .user = login_shell },
-                    .scope = .restricted,
-                },
-            },
-        } },
-        .{ .result = .{ .model_output = "broader effect" } },
-    };
-    var adapter = ProductionPermissionAdapter{
-        .turn = &turn,
-        .background = &background,
-        .workspace_root = env.workspace,
-        .tool_registry = hooks.tool_registry,
-    };
-    hooks.permission_request_override = .{
-        .context = &adapter,
-        .request_fn = ProductionPermissionAdapter.requestPermission,
-    };
-    hooks.sandbox_widening_request_override = .{
-        .context = &adapter,
-        .request_fn = ProductionPermissionAdapter.requestSandboxWidening,
-    };
-
-    const calls = [_]types.ToolCall{.{
-        .id = "revoked-sandbox-grant",
-        .name = "terminal",
-        .arguments_json = "{\"action\":\"exec\",\"command\":\"npm test\"}",
-    }};
-    const completions = [_]agent_test_support.FakeCompletion{
-        .{ .tool_calls = &calls },
-        .{ .content = "done" },
-    };
-    var gateway = agent_test_support.FakeGateway.init(alloc, &completions);
-    defer gateway.deinit();
-    var fixture = agent_test_support.PromptFixture{ .workspace_root = env.workspace };
-    var job = fixture.job();
-    job.permission_mode = .auto;
-    var config = fixture.config();
-    config.origin = .subagent;
-    config.session_child_capability = try turn.childCapability();
-    var prompt = ProductionPromptThread{
-        .gateway = &gateway,
-        .hooks = &hooks,
-        .config = config,
-        .job = job,
-    };
-    const thread = try std.Thread.spawn(.{}, ProductionPromptThread.run, .{&prompt});
-    var joined = false;
-    defer if (!joined) {
-        turn.worker.requestShutdown();
-        thread.join();
-    };
-
-    const action_approval_id = try waitForObservedToolApproval(
-        alloc,
-        &env,
-        "grant-child",
-        &durable,
-        1,
-        &prompt.finished,
-    );
-    defer alloc.free(action_approval_id);
-    try std.testing.expectEqual(
-        @as(usize, 0),
-        hooks.successful_effect_count.load(.seq_cst),
-    );
-    host.change(.ask);
-    try std.testing.expectEqual(
-        approval_registry_mod.ResolveResult.accepted,
-        try registry.resolve(
-            action_approval_id,
-            "grant-child",
-            .once,
-            null,
-            3,
-        ),
-    );
-
-    const widening_approval_id = try waitForObservedToolApproval(
-        alloc,
-        &env,
-        "grant-child",
-        &durable,
-        2,
-        &prompt.finished,
-    );
-    defer alloc.free(widening_approval_id);
-    try std.testing.expect(!std.mem.eql(
-        u8,
-        action_approval_id,
-        widening_approval_id,
-    ));
-    try std.testing.expectEqual(
-        @as(usize, 0),
-        hooks.successful_effect_count.load(.seq_cst),
-    );
-    {
-        var ledger = try env.loadCommunication(alloc, "grant-child");
-        defer ledger.deinit(alloc);
-        const widening = communication.findApproval(
-            ledger.approvals,
-            widening_approval_id,
-        ) orelse return error.TestApprovalNotRegistered;
-        try std.testing.expect(std.mem.startsWith(
-            u8,
-            widening.label,
-            "broader file access: # terminal.exec profile=user shell=",
-        ));
-        try std.testing.expect(std.mem.endsWith(u8, widening.label, "\\x0anpm test"));
-        try std.testing.expectEqual(
-            communication.ApprovalStatus.pending,
-            widening.status,
-        );
-    }
-    try std.testing.expectEqual(
-        approval_registry_mod.ResolveResult.accepted,
-        try registry.resolve(
-            widening_approval_id,
-            "grant-child",
-            .once,
-            null,
-            4,
-        ),
-    );
-    thread.join();
-    joined = true;
-    try std.testing.expect(!prompt.failed.load(.seq_cst));
-    try std.testing.expectEqual(
-        @as(usize, 1),
-        hooks.successful_effect_count.load(.seq_cst),
-    );
-}
-
 const GatewayExecution = struct {
     calls: std.atomic.Value(usize) = std.atomic.Value(usize).init(0),
 
@@ -8973,7 +8484,6 @@ const GatewayExecution = struct {
         return .{
             .generation = 1,
             .tools = tools,
-            .sandbox_backend = .macos,
             .integrations = integrations,
             .rules = .{ .rules = rules },
             .grants = grants,
@@ -9003,7 +8513,6 @@ const GatewayExecution = struct {
             .source_id = request.source_id,
             .model = request.preferences.model,
             .effort = request.preferences.effort,
-            .sandbox_backend = .none,
             .tool_names = &.{ "read_file", "grep_files", "mcp_select_tool" },
             .rules = .{ .rules = &rules },
             .grants = &grants,
@@ -9038,7 +8547,7 @@ const GatewayExecution = struct {
         cancel: *std.atomic.Value(bool),
     ) !RunOutcome {
         const self: *GatewayExecution = @ptrCast(@alignCast(raw.?));
-        if (admission.permission_mode != .yolo or admission.sandbox_backend != .none or
+        if (admission.permission_mode != .yolo or
             admission.tool_names.len != 3 or admission.integration_names.len != 1 or
             !std.mem.eql(u8, admission.parent_id, "parent") or
             !std.mem.eql(u8, admission.source_id, "parent")) return error.InvalidAdmissionSnapshot;
@@ -9110,7 +8619,6 @@ const GatewayExecution = struct {
         job.prompt = message.content;
         job.model = admission.model;
         job.permission_mode = admission.permission_mode;
-        job.sandbox_backend = admission.sandbox_backend;
         job.history = history;
         job.grants = admission.grants;
         var config = fixture.config();
@@ -9137,7 +8645,6 @@ const GatewayExecution = struct {
         )) return error.GrantNotInherited;
         if (hooks.last_live_authority_generation == null or
             hooks.last_live_authority_generation.? == 0 or
-            hooks.last_live_authority_sandbox != .none or
             hooks.last_live_authority_tool_count != 4 or
             hooks.last_live_authority_integration_count != 1 or
             hooks.last_live_authority_rule_count != 1 or
@@ -9449,7 +8956,6 @@ fn checkAdmissionAllocationFailures(alloc: Allocator) !void {
         .source_id = "source",
         .model = "model",
         .effort = types.ReasoningEffort.literal("high"),
-        .sandbox_backend = .macos,
         .tool_names = &.{ "read_file", "write_file" },
         .integration_names = &.{"mcp:test"},
     });

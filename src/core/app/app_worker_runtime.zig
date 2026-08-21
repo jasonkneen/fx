@@ -735,9 +735,9 @@ pub fn Runtime(comptime App: type) type {
                             drain_owns_current = false;
                             break :events;
                         }
-                        markAssistantText(app);
                         switch (presentation) {
                             .text => |text| {
+                                app.stream = nextStreamAfterAssistantText(app.stream, text);
                                 try handlers.append_text(handlers.ctx, text);
                                 debug_trace.eventf(
                                     "worker",
@@ -748,14 +748,17 @@ pub fn Runtime(comptime App: type) type {
                                 );
                             },
                             .table => |table| {
+                                markAssistantText(app);
                                 drain_owns_current = false;
                                 try handlers.append_table(handlers.ctx, table);
                             },
                             .code_block => |block| {
+                                markAssistantText(app);
                                 drain_owns_current = false;
                                 try handlers.append_code_block(handlers.ctx, block);
                             },
                             .thematic_rule => {
+                                markAssistantText(app);
                                 drain_owns_current = false;
                                 try handlers.append_thematic_rule(handlers.ctx);
                             },
@@ -1035,6 +1038,23 @@ pub fn Runtime(comptime App: type) type {
             if (changed and !animation_armed) app.shell.render_requests.request(.footer);
         }
     };
+}
+
+fn nextStreamAfterAssistantText(
+    current: types.StreamState,
+    text: []const u8,
+) types.StreamState {
+    var next = current;
+    if (current.composing_tool_payload and
+        std.mem.trim(u8, text, " \t\r\n").len == 0)
+    {
+        next.assistant_text_started = false;
+        return next;
+    }
+
+    next.assistant_text_started = true;
+    next.composing_tool_payload = false;
+    return next;
 }
 
 fn formatWebSearchProgress(alloc: std.mem.Allocator, progress: types.WebSearchProgress) ![]u8 {
@@ -3056,6 +3076,26 @@ test "core.app_worker_runtime lifecycle starts drain real paced text into one as
         app.shell.lifecycle.entries.items[2].raw_bytes.bytes,
     );
     try std.testing.expectEqual(@as(usize, 2), app.shell.lifecyclePinCount());
+}
+
+test "core.app_worker_runtime structural separator opens thinking stretch during tool composition" {
+    var app = FakeApp.init(std.testing.allocator);
+    defer app.deinit();
+    app.worker.processing = true;
+    app.stream = .{
+        .active = true,
+        .assistant_text_started = true,
+        .composing_tool_payload = true,
+    };
+
+    try app.worker.pushEvent(std.heap.c_allocator, .{
+        .assistant_presentation = .{ .text = @constCast("\n") },
+    });
+
+    try tickNoop(&app);
+
+    try std.testing.expect(!app.stream.assistant_text_started);
+    try std.testing.expect(app.stream.composing_tool_payload);
 }
 
 test "core.app_worker_runtime provisional tool start opens the next thinking stretch" {

@@ -39,11 +39,13 @@ pub const ProviderRoute = struct {
 pub const ProviderRoutes = struct {
     gateway: ProviderRoute,
     codex: ProviderRoute,
+    grok: ProviderRoute,
 
     pub fn select(self: ProviderRoutes, provider: model_provider.ProviderId) ProviderRoute {
         return switch (provider) {
             .gateway => self.gateway,
             .codex => self.codex,
+            .grok => self.grok,
         };
     }
 };
@@ -51,10 +53,13 @@ pub const ProviderRoutes = struct {
 test "provider routes select independent streams and reviewers" {
     var gateway_tag: u8 = 0;
     var codex_tag: u8 = 0;
+    var grok_tag: u8 = 0;
     var gateway_stream = stream_provider.unavailable_provider;
     gateway_stream.context = &gateway_tag;
     var codex_stream = stream_provider.unavailable_provider;
     codex_stream.context = &codex_tag;
+    var grok_stream = stream_provider.unavailable_provider;
+    grok_stream.context = &grok_tag;
     const Reviewer = struct {
         fn review(
             _: ?*anyopaque,
@@ -67,15 +72,19 @@ test "provider routes select independent streams and reviewers" {
     };
     const gateway_reviewer = auto_classifier.Provider{ .context = &gateway_tag, .review_fn = Reviewer.review };
     const codex_reviewer = auto_classifier.Provider{ .context = &codex_tag, .review_fn = Reviewer.review };
+    const grok_reviewer = auto_classifier.Provider{ .context = &grok_tag, .review_fn = Reviewer.review };
     const routes = ProviderRoutes{
         .gateway = .{ .agent_stream_provider = gateway_stream, .permission_reviewer_provider = gateway_reviewer },
         .codex = .{ .agent_stream_provider = codex_stream, .permission_reviewer_provider = codex_reviewer },
+        .grok = .{ .agent_stream_provider = grok_stream, .permission_reviewer_provider = grok_reviewer },
     };
 
     try std.testing.expect(routes.select(.gateway).agent_stream_provider.context.? == @as(*anyopaque, @ptrCast(&gateway_tag)));
     try std.testing.expect(routes.select(.gateway).permission_reviewer_provider.?.context.? == @as(*anyopaque, @ptrCast(&gateway_tag)));
     try std.testing.expect(routes.select(.codex).agent_stream_provider.context.? == @as(*anyopaque, @ptrCast(&codex_tag)));
     try std.testing.expect(routes.select(.codex).permission_reviewer_provider.?.context.? == @as(*anyopaque, @ptrCast(&codex_tag)));
+    try std.testing.expect(routes.select(.grok).agent_stream_provider.context.? == @as(*anyopaque, @ptrCast(&grok_tag)));
+    try std.testing.expect(routes.select(.grok).permission_reviewer_provider.?.context.? == @as(*anyopaque, @ptrCast(&grok_tag)));
 }
 
 pub const Config = struct {
@@ -113,7 +122,6 @@ const Context = struct {
         result.session_grants = self.admission.grants;
         result.permission_rules = self.admission.rules;
         result.permission_state_override = &self.admission.permission_state;
-        result.sandbox_backend = self.admission.sandbox_backend;
         result.advertised_dynamic_tool_names = self.admission.integration_names;
         result.mcp_access = if (self.admission.mcp_view) |*view|
             .{ .scoped = .{
@@ -239,7 +247,6 @@ pub fn run(
         else
             null,
         .permission_mode = admission.permission_mode,
-        .sandbox_backend = admission.sandbox_backend,
         .history = history,
         .root_user_intent_context = if (message.root_user_intent_context.len > 0)
             arena.dupe(u8, message.root_user_intent_context) catch return error.OutOfMemory
@@ -326,7 +333,6 @@ fn runtimeDeps(context: *Context) agent_runtime.AgentRuntimeDeps {
         .check_tool_availability = checkToolAvailability,
         .request_tool_permission = requestToolPermission,
         .request_prepared_file_mutation_permission = requestPreparedFileMutationPermission,
-        .request_sandbox_widening = requestSandboxWidening,
         .resolve_tool_action_display_target = resolveToolActionDisplayTarget,
         .describe_tool_action = describeToolAction,
         .describe_tool_action_completed = describeToolAction,
@@ -422,7 +428,6 @@ fn appendRuntimeContext(raw: *anyopaque, arena: Allocator, messages: *std.ArrayL
         .access_scope = tool_ctx.access_scope,
         .interactive = false,
         .permission_mode = context.admission.permission_mode,
-        .sandbox_backend = context.admission.sandbox_backend,
         .tracker = null,
         .background = tool_ctx.background,
         .session = context.turn.sessionRuntime(),
@@ -548,16 +553,6 @@ fn requestToolPermission(
             action.authority,
             action.human_approval,
         ),
-        .sandbox_widening => |widening| tool_admission.revalidateLiveSandboxWideningOutcome(
-            tool_ctx.admissionInputWithLiveAuthority(live),
-            arena,
-            call,
-            mode,
-            grants,
-            widening.authority,
-            widening.required.wideningInput(),
-            widening.human_approval,
-        ),
     };
     return tool_admission.requestPermissionOutcome(
         tool_ctx.admissionInputWithLiveAuthority(live),
@@ -588,29 +583,6 @@ fn requestPreparedFileMutationPermission(
         prepared,
         mode,
         grants,
-    );
-}
-
-fn requestSandboxWidening(
-    raw: *anyopaque,
-    arena: Allocator,
-    call: types.ToolCall,
-    review: auto_classifier.ReviewTurnContext,
-    mode: types.PermissionMode,
-    grants: []const types.PermissionGrant,
-    live: ?agent_runtime.LiveToolAuthority,
-    dynamic_names: []const []const u8,
-    required: agent_runtime.SandboxScopeRequired,
-) !command_admission.PermissionOutcome {
-    const context: *Context = @ptrCast(@alignCast(raw));
-    const tool_ctx = admissionContext(context, dynamic_names, review);
-    return tool_admission.requestSandboxWideningOutcome(
-        tool_ctx.admissionInputWithLiveAuthority(live),
-        arena,
-        call,
-        mode,
-        grants,
-        required.wideningInput(),
     );
 }
 

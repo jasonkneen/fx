@@ -23,7 +23,6 @@ const permission_auto_classifier = @import("../core/permissions/auto_classifier.
 const auto_classifier_context = @import("../core/permissions/auto_classifier_context.zig");
 const permission_gate = @import("../core/permissions/permission_gate.zig");
 const permission_request = @import("../core/permissions/permission_request.zig");
-const sandbox = @import("../core/permissions/sandbox.zig");
 const session_codec = @import("../core/session/session_codec.zig");
 const session_log = @import("../core/session/session_log.zig");
 const session_store = @import("../core/session/session_store.zig");
@@ -41,7 +40,6 @@ const context_contract = @import("../core/workspace/context_contract.zig");
 const config_runtime = @import("../core/config/config_runtime.zig");
 const model_capabilities = @import("../core/config/model_capabilities.zig");
 const mode_registry = @import("../core/modes/mode_registry.zig");
-const devbox_executor = @import("../core/execution/devbox_executor.zig");
 const debug_trace = @import("../core/shared/debug_trace.zig");
 const display_width = @import("../core/shared/display_width.zig");
 const text_utils = @import("../core/shared/text_utils.zig");
@@ -99,7 +97,6 @@ const AcpContext = struct {
     /// session/set_mode changes never mutate a running turn.
     captured_mode: ?[]const u8 = null,
     captured_permission_mode: ?PermissionMode = null,
-    captured_sandbox_backend: ?sandbox.BackendKind = null,
 
     fn deinitPublishedToolCalls(self: *AcpContext) void {
         var keys = self.published_tool_calls.keyIterator();
@@ -250,6 +247,7 @@ const AcpContext = struct {
             .permission_reviewer_provider = switch (session.provider) {
                 .gateway => self.state.cfg.permission_reviewer_provider,
                 .codex => self.state.cfg.codex_permission_reviewer_provider,
+                .grok => self.state.cfg.grok_permission_reviewer_provider,
             },
             .auto_classifier = self.auto_classifier,
             .subagent_host = self.state.subagent_host,
@@ -279,8 +277,6 @@ const AcpContext = struct {
             else
                 null,
             .terminal_client = &self.state.terminal_client,
-            .sandbox_backend = self.captured_sandbox_backend orelse session.sandbox_backend,
-            .devbox_provider = self.state.cfg.devbox_provider,
             .web_fetch_runtime = &self.state.web_fetch_runtime,
             .web_fetch_artifact_store = session.session_rt.webFetchArtifactStore(),
             .web_fetch_artifact_error = session.session_rt.webFetchArtifactError(),
@@ -440,7 +436,6 @@ pub fn handlePrompt(
     msg: *jsonrpc.Message,
     captured_mode: []const u8,
     captured_permission_mode: PermissionMode,
-    captured_sandbox_backend: sandbox.BackendKind,
 ) !TerminalOutcome {
     const session = if (state.active_session) |*active| active else return .{
         .rpc_error = no_active_session_rpc_error,
@@ -450,6 +445,8 @@ pub fn handlePrompt(
             .code = ErrorCode.invalid_request,
             .message = if (session.provider == .codex)
                 credentials.missing_chatgpt_credential_message
+            else if (session.provider == .grok)
+                credentials.missing_grok_credential_message
             else
                 credentials.missing_credential_message,
         } };
@@ -508,7 +505,6 @@ pub fn handlePrompt(
         .session_id = session.session_id,
         .captured_mode = captured_mode,
         .captured_permission_mode = captured_permission_mode,
-        .captured_sandbox_backend = captured_sandbox_backend,
     };
     defer ctx.deinitPublishedToolCalls();
 
@@ -589,7 +585,6 @@ pub fn handlePrompt(
         .provider = session.provider,
         .gateway_team = state.gateway_team,
         .permission_mode = captured_permission_mode,
-        .sandbox_backend = captured_sandbox_backend,
         .history = context_history,
         .root_user_intent_context = root_user_intent_context,
         .grants = session.session_grants,
@@ -668,7 +663,6 @@ pub fn runSubagentChild(
         .session_id = session_id,
         .captured_mode = captured_mode,
         .captured_permission_mode = admission.permission_mode,
-        .captured_sandbox_backend = admission.sandbox_backend,
     };
     defer ctx.deinitPublishedToolCalls();
     var child_projection = state.cfg.mode_registry.buildGatewayToolProjection(
@@ -707,6 +701,10 @@ pub fn runSubagentChild(
             .codex = .{
                 .agent_stream_provider = server.streamProviderFor(state, .codex),
                 .permission_reviewer_provider = state.cfg.codex_permission_reviewer_provider,
+            },
+            .grok = .{
+                .agent_stream_provider = server.streamProviderFor(state, .grok),
+                .permission_reviewer_provider = state.cfg.grok_permission_reviewer_provider,
             },
         },
         .system_prompt = state.cfg.prompt_policy.system_prompt,
@@ -987,7 +985,6 @@ fn agentRuntimeDeps(ctx: *AcpContext) agent_runtime.AgentRuntimeDeps {
         .check_tool_availability = checkToolAvailability,
         .request_tool_permission = requestToolPermissionOutcomeWithRequest,
         .request_prepared_file_mutation_permission = requestPreparedFileMutationPermissionOutcomeForRuntime,
-        .request_sandbox_widening = requestSandboxWideningForRuntime,
         .resolve_tool_action_display_target = resolveToolActionDisplayTarget,
         .describe_tool_action = describeToolAction,
         .describe_tool_action_completed = describeToolActionCompleted,
@@ -1105,7 +1102,12 @@ fn resolveModelCapabilities(
         ctx.state.alloc,
         ctx.state.cfg.gateway_provider.model_catalog,
         .{
-            .access = credentials.catalogAccessForCredential(session.credential_source, session.api_key, ctx.state.gateway_team),
+            .access = credentials.catalogAccessForCredentialAndAccount(
+                session.credential_source,
+                session.api_key,
+                ctx.state.gateway_team,
+                session.account_id,
+            ),
             .endpoint = ctx.state.cfg.gateway_models_path,
             .cancel_flag = &session.cancel_flag,
         },
@@ -1139,7 +1141,6 @@ fn appendRuntimeContext(raw_ctx: *anyopaque, arena: Allocator, messages: *std.Ar
         .access_scope = ctx.state.workspace_access.scope(ctx.state.workspace_root),
         .interactive = false,
         .permission_mode = ctx.captured_permission_mode orelse session.permission_mode,
-        .sandbox_backend = ctx.captured_sandbox_backend orelse session.sandbox_backend,
         .tracker = null,
         .background = &ctx.state.background,
         .session = &session.session_rt,
@@ -1217,33 +1218,6 @@ fn checkToolAvailability(raw_ctx: *anyopaque, arena: Allocator, call: ToolCall) 
     return tool_runtime.checkToolAvailability(ctx.toolContext(), arena, call);
 }
 
-fn requestSandboxWideningForRuntime(
-    raw_ctx: *anyopaque,
-    arena: Allocator,
-    call: ToolCall,
-    review_turn: permission_auto_classifier.ReviewTurnContext,
-    permission_mode: PermissionMode,
-    local_grants: []const PermissionGrant,
-    live_authority: ?agent_runtime.LiveToolAuthority,
-    advertised_dynamic_tool_names: []const []const u8,
-    required: agent_runtime.SandboxScopeRequired,
-) !command_admission.PermissionOutcome {
-    const ctx: *AcpContext = @ptrCast(@alignCast(raw_ctx));
-    var tool_ctx = tool_runtime.withAdvertisedDynamicToolNames(
-        ctx.toolContext(),
-        advertised_dynamic_tool_names,
-    );
-    tool_ctx.permission_review_turn = review_turn;
-    return tool_admission.requestSandboxWideningOutcome(
-        tool_ctx.admissionInputWithLiveAuthority(live_authority),
-        arena,
-        call,
-        permission_mode,
-        local_grants,
-        required.wideningInput(),
-    );
-}
-
 fn requestPreparedFileMutationPermissionOutcomeForRuntime(raw_ctx: *anyopaque, arena: Allocator, call: ToolCall, prepared: *tool_admission.PreparedFileMutationCall, review_turn: permission_auto_classifier.ReviewTurnContext, permission_mode: PermissionMode, local_grants: []const PermissionGrant, live_authority: ?agent_runtime.LiveToolAuthority, advertised_dynamic_tool_names: []const []const u8) !command_admission.PermissionOutcome {
     const ctx: *AcpContext = @ptrCast(@alignCast(raw_ctx));
     var tool_ctx = tool_runtime.withAdvertisedDynamicToolNames(ctx.toolContext(), advertised_dynamic_tool_names);
@@ -1285,16 +1259,6 @@ fn requestToolPermissionOutcomeWithRequest(raw_ctx: *anyopaque, arena: Allocator
             local_grants,
             action.authority,
             action.human_approval,
-        ),
-        .sandbox_widening => |widening| tool_admission.revalidateLiveSandboxWideningOutcome(
-            admission,
-            arena,
-            call,
-            permission_mode,
-            local_grants,
-            widening.authority,
-            widening.required.wideningInput(),
-            widening.human_approval,
         ),
     } else tool_admission.requestPermissionOutcome(
         admission,
@@ -1520,12 +1484,11 @@ fn executeToolCall(
 
 fn sendAuthorizedToolCallError(
     ctx: *AcpContext,
-    request: agent_runtime.ToolExecutionRequest,
+    _: agent_runtime.ToolExecutionRequest,
     acp_id: []const u8,
-    err: anyerror,
+    _: anyerror,
     err_text: []const u8,
 ) void {
-    if (request.isSandboxWideningRetryCancellationError(err)) return;
     ctx.sendToolCallError(acp_id, err_text) catch {};
 }
 
@@ -1535,7 +1498,6 @@ fn completeAuthorizedToolCallTransport(
     acp_id: []const u8,
     result: ToolExecutionResult,
 ) ToolExecutionResult {
-    if (request.resultAwaitsSandboxWidening(result)) return result;
     return completeToolCallTransport(ctx, request.call, acp_id, result);
 }
 
@@ -1769,7 +1731,6 @@ test "ACP degraded history repair commits the finished turn once" {
         .effort = .auto,
         .first_call_tool_choice = .auto,
         .permission_mode = .auto,
-        .sandbox_backend = .none,
         .permission_rules = .{},
         .session_rt = .{ .max_history_turns = 8 },
         .cancel_flag = std.atomic.Value(bool).init(false),
@@ -3299,7 +3260,6 @@ const AcpContextRegistryFixture = struct {
     var static_context: ?[]const u8 = null;
     var transient_calls: usize = 0;
     var transient_permission_mode: ?PermissionMode = null;
-    var transient_sandbox_backend: sandbox.BackendKind = .none;
 
     fn reset() void {
         gather_calls = 0;
@@ -3307,7 +3267,6 @@ const AcpContextRegistryFixture = struct {
         static_context = null;
         transient_calls = 0;
         transient_permission_mode = null;
-        transient_sandbox_backend = .none;
     }
 
     fn gather(alloc: Allocator, _: context_contract.InitialContextInput) context_contract.ProviderError!context_contract.ProviderContext {
@@ -3324,7 +3283,6 @@ const AcpContextRegistryFixture = struct {
     fn appendTransient(input: context_contract.TransientContextInput, alloc: Allocator, messages: *std.ArrayList(ChatMessage)) context_contract.ProviderError!void {
         transient_calls += 1;
         transient_permission_mode = input.permission_mode;
-        transient_sandbox_backend = input.sandbox_backend;
         try messages.append(alloc, .{ .role = .system, .content = "ACP registry transient" });
     }
 };
@@ -3357,16 +3315,6 @@ fn testModelPromptOverlay(model: []const u8) ?[]const u8 {
     return if (std.mem.eql(u8, model, "test-model")) "ACP test model overlay" else null;
 }
 
-fn unavailableDevboxForTest(
-    _: ?*anyopaque,
-    _: Allocator,
-    _: []const u8,
-    _: []const u8,
-    _: devbox_executor.Control,
-) devbox_executor.ProviderError!devbox_executor.VercelOutcome {
-    return .unavailable;
-}
-
 fn testServerConfig() server.Config {
     return .{
         .default_model = "test-model",
@@ -3390,7 +3338,6 @@ fn testServerConfig() server.Config {
         .max_history_turns = 8,
         .context_registry = test_acp_context_registry,
         .mode_registry = test_acp_mode_registry,
-        .devbox_provider = .{ .execute_fn = unavailableDevboxForTest },
     };
 }
 
@@ -3404,7 +3351,6 @@ fn initTestAcpState(alloc: Allocator, workspace_root: []const u8, mode: Permissi
     const api_key = try alloc.dupe(u8, "test-api-key");
     errdefer alloc.free(api_key);
 
-    const selected_backend: sandbox.BackendKind = .none;
     const cfg = testServerConfig();
     return .{
         .alloc = alloc,
@@ -3413,7 +3359,6 @@ fn initTestAcpState(alloc: Allocator, workspace_root: []const u8, mode: Permissi
         .workspace_root = owned_workspace,
         .api_key = api_key,
         .credential_source = .ai_gateway_api_key,
-        .sandbox_backend = selected_backend,
         .web_search_runtime = @import("../core/tooling/web_search_runtime.zig").Runtime.init(.{
             .provider = cfg.gateway_provider.web_search,
         }),
@@ -3430,7 +3375,6 @@ fn initTestAcpState(alloc: Allocator, workspace_root: []const u8, mode: Permissi
             .effort = .auto,
             .first_call_tool_choice = .auto,
             .permission_mode = mode,
-            .sandbox_backend = selected_backend,
             .permission_rules = .{},
             .session_rt = .{ .max_history_turns = 8 },
             .cancel_flag = std.atomic.Value(bool).init(false),
@@ -3508,117 +3452,6 @@ test "ACP pending tool_call updates keep provider ids stable and dedupe" {
         pending_count += 1;
     }
     try std.testing.expectEqual(@as(usize, 1), pending_count);
-}
-
-test "ACP defers cancelled sandbox retry to one combined failed update" {
-    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer arena_state.deinit();
-    const alloc = arena_state.allocator();
-    var tmp = std.testing.tmpDir(.{});
-    defer tmp.cleanup();
-
-    var capture = try tmp.dir.createFile(io_mod.getIo(), "acp-retry-cancel.jsonl", .{ .read = true });
-    defer capture.close(io_mod.getIo());
-    var state = try initTestAcpState(alloc, "/tmp/workspace", .ask);
-    defer state.deinit();
-    state.writer = .{ .stdout = capture };
-    var ctx = AcpContext{
-        .alloc = alloc,
-        .state = &state,
-        .session_id = "session_1",
-    };
-    defer ctx.deinitPublishedToolCalls();
-
-    const call = ToolCall{
-        .id = "retry_call",
-        .name = "terminal",
-        .arguments_json = "{\"action\":\"exec\",\"command\":\"npm test\"}",
-    };
-    const acp_id = try ctx.sendToolCallPending(alloc, call);
-    const request: agent_runtime.ToolExecutionRequest = .{
-        .call_allocator = alloc,
-        .result_allocator = alloc,
-        .call = call,
-        .authority = .{ .run_command = .{ .shell_allowed = .{
-            .fingerprint = .{
-                .command = "npm test",
-                .resolved_cwd = "/tmp/workspace",
-                .background = false,
-                .resolved_backend = .none,
-                .target_os = std_builtin.os.tag,
-                .scope = .broader,
-            },
-            .source = .auto_classifier,
-        } } },
-        .session_grants = &.{},
-        .advertised_dynamic_tool_names = &.{},
-        .max_tool_result_bytes = 64 * 1024,
-    };
-    sendAuthorizedToolCallError(
-        &ctx,
-        request,
-        acp_id,
-        error.CancelledBeforeExecution,
-        "raw retry pre-spawn cancellation",
-    );
-    sendAuthorizedToolCallError(
-        &ctx,
-        request,
-        acp_id,
-        error.Cancelled,
-        "raw retry error cancellation",
-    );
-    _ = completeAuthorizedToolCallTransport(&ctx, request, acp_id, .{
-        .status = .failure,
-        .cancelled = true,
-        .model_output = "raw retry cancellation",
-        .command_result_json = "{\"attempt\":\"broader\"}",
-    });
-    try recordToolCallRejected(
-        @ptrCast(&ctx),
-        alloc,
-        call,
-        "combined restricted and broader evidence",
-        "{\"attempt\":\"broader\",\"retained\":true}",
-    );
-    try capture.sync(io_mod.getIo());
-
-    {
-        var captured_file = try tmp.dir.openFile(io_mod.getIo(), "acp-retry-cancel.jsonl", .{});
-        defer captured_file.close(io_mod.getIo());
-        const captured = try io_mod.readFileToEnd(alloc, &captured_file, 64 * 1024);
-        try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, captured, "\"status\":\"failed\""));
-        try std.testing.expect(std.mem.find(u8, captured, "raw retry pre-spawn cancellation") == null);
-        try std.testing.expect(std.mem.find(u8, captured, "raw retry error cancellation") == null);
-        try std.testing.expect(std.mem.find(u8, captured, "raw retry cancellation") == null);
-        try std.testing.expect(std.mem.find(u8, captured, "combined restricted and broader evidence") != null);
-        try std.testing.expect(std.mem.find(u8, captured, "\"retained\":true") != null);
-    }
-
-    const ordinary_call = ToolCall{
-        .id = "ordinary_call",
-        .name = "terminal",
-        .arguments_json = "{\"action\":\"exec\",\"command\":\"npm test\"}",
-    };
-    const ordinary_acp_id = try ctx.sendToolCallPending(alloc, ordinary_call);
-    var ordinary_request = request;
-    ordinary_request.call = ordinary_call;
-    ordinary_request.authority = .ordinary;
-    sendAuthorizedToolCallError(
-        &ctx,
-        ordinary_request,
-        ordinary_acp_id,
-        error.Cancelled,
-        "ordinary error cancellation",
-    );
-    try capture.sync(io_mod.getIo());
-    {
-        var captured_file = try tmp.dir.openFile(io_mod.getIo(), "acp-retry-cancel.jsonl", .{});
-        defer captured_file.close(io_mod.getIo());
-        const captured = try io_mod.readFileToEnd(alloc, &captured_file, 64 * 1024);
-        try std.testing.expectEqual(@as(usize, 2), std.mem.count(u8, captured, "\"status\":\"failed\""));
-        try std.testing.expect(std.mem.find(u8, captured, "ordinary error cancellation") != null);
-    }
 }
 
 test "ACP propagateGrant stores deduped runtime session grants" {
@@ -3699,7 +3532,7 @@ test "ACP prompt propagates context provider errors before pending prompt state"
         AcpContextRegistryFixture.gather_error = expected_error;
         try std.testing.expectError(
             expected_error,
-            handlePrompt(&state, alloc, &msg, "code", .ask, .none),
+            handlePrompt(&state, alloc, &msg, "code", .ask),
         );
         try std.testing.expectEqual(@as(usize, 1), AcpContextRegistryFixture.gather_calls);
         try std.testing.expect(state.active_session.?.pending_prompt_id == null);
@@ -3720,10 +3553,8 @@ test "ACP registry callbacks preserve snapshot bytes before transient context" {
         .state = &state,
         .session_id = state.active_session.?.session_id,
         .captured_permission_mode = .auto,
-        .captured_sandbox_backend = .macos,
     };
     state.active_session.?.permission_mode = .ask;
-    state.active_session.?.sandbox_backend = .none;
     const deps = agentRuntimeDeps(&ctx);
     try std.testing.expect(deps.context_enabled);
     try std.testing.expectEqualStrings(
@@ -3755,11 +3586,9 @@ test "ACP registry callbacks preserve snapshot bytes before transient context" {
         PermissionMode.auto,
         AcpContextRegistryFixture.transient_permission_mode orelse return error.TestExpectedEqual,
     );
-    try std.testing.expectEqual(sandbox.BackendKind.macos, AcpContextRegistryFixture.transient_sandbox_backend);
 
     const tool_context = ctx.toolContext();
     try std.testing.expectEqual(PermissionMode.auto, tool_context.permission_mode);
-    try std.testing.expectEqual(sandbox.BackendKind.macos, tool_context.sandbox_backend);
     try std.testing.expectEqualStrings("test.acp_context", tool_context.context_registry.defaultProvider().id);
 
     state.context_enabled = false;
@@ -4436,5 +4265,4 @@ test "ACP prompt agent config carries request options from active session" {
     try std.testing.expectEqual(state.cfg.gateway_retry_count, state.web_search_runtime.gateway_retry_count);
     try std.testing.expectEqualStrings(state.cfg.gateway_chat_url, state.web_search_runtime.gateway_chat_url);
     try std.testing.expectEqualStrings("/models", tool_ctx.gateway_models_path);
-    try std.testing.expect(tool_ctx.devbox_provider.?.execute_fn == unavailableDevboxForTest);
 }

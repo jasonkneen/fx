@@ -352,6 +352,7 @@ pub const SessionPreferencePatch = struct {
             switch (provider) {
                 .gateway => patch.model = self.model,
                 .codex => patch.codex_model = self.model,
+                .grok => patch.grok_model = self.model,
             }
         } else {
             patch.model = self.model;
@@ -1827,7 +1828,7 @@ pub fn Runtime(comptime App: type) type {
         pub fn startResumedSessionReconciliation(app: *App) void {
             if (comptime @hasField(App, "auth")) {
                 if (comptime @hasDecl(@TypeOf(app.auth), "credentialSource")) {
-                    if (app.auth.credentialSource() == .chatgpt_subscription) {
+                    if (app.auth.credentialSource() == .chatgpt_subscription or app.auth.credentialSource() == .grok_subscription) {
                         app.session.usage.clearReconciliationCredential();
                         return;
                     }
@@ -4603,7 +4604,6 @@ pub fn Runtime(comptime App: type) type {
                     .tool_set = app.toolAdvertisementSet(),
                     .mode = .full,
                 },
-                if (comptime @hasField(App, "permission_state")) app.permission_state.sandbox_backend else .none,
                 integrations,
                 if (comptime @hasField(App, "permission_engine")) app.permission_engine.rules else .{},
                 if (comptime @hasField(App, "permission_engine")) app.permission_engine.grants.items else &.{},
@@ -5205,7 +5205,6 @@ const TestApp = struct {
     permission_engine: permissions.PermissionEngine = .{},
     permission_state: struct {
         authority_mutex: std.Io.Mutex = .init,
-        sandbox_backend: types.BackendKind = .none,
     } = .{},
     mcp_tool_names: std.ArrayList([]u8) = .empty,
 
@@ -6431,7 +6430,7 @@ test "enableSessionStores replaces existing subagent host without leaking" {
     try std.testing.expect(app.session_persistence.subagent_host != null);
 }
 
-test "interactive subagent host resolves current tools rules grants sandbox and integrations" {
+test "interactive subagent host resolves current tools rules grants and integrations" {
     const alloc = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -6457,10 +6456,8 @@ test "interactive subagent host resolves current tools rules grants sandbox and 
         root_id,
     );
     defer initial.deinit(alloc);
-    try std.testing.expectEqual(types.BackendKind.none, initial.sandbox_backend);
     try std.testing.expectEqual(@as(usize, 0), initial.integrations.len);
 
-    app.permission_state.sandbox_backend = .vercel;
     try app.permission_engine.allow(alloc, "run_command", "zig build test");
     try app.mcp_tool_names.append(alloc, try alloc.dupe(u8, "mcp_fixture_echo"));
     var changed = try host.host_authority.resolve_fn(
@@ -6469,7 +6466,6 @@ test "interactive subagent host resolves current tools rules grants sandbox and 
         root_id,
     );
     defer changed.deinit(alloc);
-    try std.testing.expectEqual(types.BackendKind.vercel, changed.sandbox_backend);
     try std.testing.expectEqualStrings("mcp_fixture_echo", changed.integrations[0]);
     try std.testing.expectEqualStrings("zig build test", changed.grants[0].target_path);
     try std.testing.expect(initial.generation != changed.generation);

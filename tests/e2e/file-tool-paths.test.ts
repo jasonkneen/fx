@@ -15,7 +15,6 @@ import { EVAL_MODEL, HAS_API_KEY, runFx } from "../evals/eval-helpers";
 
 const TIMEOUT = 20_000;
 const MODEL = "openai/gpt-5";
-const darwinTest = test.skipIf(process.platform !== "darwin");
 const liveTest = test.skipIf(
   !HAS_API_KEY || process.env.FX_E2E_REAL_API !== "1",
 );
@@ -601,19 +600,18 @@ describe("filesystem path handling", () => {
     TIMEOUT,
   );
 
-  darwinTest(
-    "macOS sandbox grants command writes only through an active added root",
+  test(
+    "captured commands write through an active added root",
     async () => {
       const root = createIsolatedRoot();
-      const marker = join(root.external, "sandbox-proof.txt");
-      writeFileSync(join(root.workspace, ".fx.json"), JSON.stringify({ sandbox: "os" }));
+      const marker = join(root.external, "command-proof.txt");
       const gateway = startFakeGateway([
-        toolCall("added_sandbox_write_1", "terminal", {
+        toolCall("added_command_write_1", "terminal", {
           action: "exec",
-          command: "printf SANDBOX_ADDED_WRITE > sandbox-proof.txt",
+          command: "printf COMMAND_ADDED_WRITE > command-proof.txt",
           cwd: root.external,
         }),
-        finalText("sandbox write complete"),
+        finalText("command write complete"),
       ]);
       try {
         const result = await runFx(
@@ -634,7 +632,7 @@ describe("filesystem path handling", () => {
           },
         );
         const json = parseFxJson(result);
-        expect(readFileSync(marker, "utf8")).toBe("SANDBOX_ADDED_WRITE");
+        expect(readFileSync(marker, "utf8")).toBe("COMMAND_ADDED_WRITE");
         expect(json.tool_calls.map(({ name, status }) => ({ name, status }))).toEqual([
           { name: "terminal", status: "success" },
         ]);

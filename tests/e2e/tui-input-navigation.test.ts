@@ -322,7 +322,7 @@ tmuxTest(
     await waitForExactComposerRow(active, "❯ /");
 
     await active.sendKeys("Enter");
-    await active.waitForText("Commands 40", READY_TIMEOUT);
+    await active.waitForText("Commands 38", READY_TIMEOUT);
     await active.sendKeys("Escape");
     await active.waitForText("Run /help for commands", READY_TIMEOUT);
     expect(active.isAlive()).toBe(true);
@@ -1572,14 +1572,14 @@ tmuxTest(
   "positive slash argument picker uses exact rendered columns",
   async () => {
     const active = await startFx(80, 24);
-    await typeLiteral(active, "  /sandbox ");
-    await expectOptionColumn(active, "os", 13);
+    await typeLiteral(active, "  /maxxing ");
+    await expectOptionColumn(active, "minimal", 13);
 
     // Margin spaces hang on row 0 while the slash command wraps below them.
     await active.resizeWindow(8, 6, 300);
     await active.sendKeys("C-u");
-    await typeLiteral(active, "       /sandbox ");
-    await expectOptionColumn(active, "non", 5);
+    await typeLiteral(active, "       /maxxing ");
+    await expectOptionColumn(active, "min", 5);
   },
   TIMEOUT,
 );

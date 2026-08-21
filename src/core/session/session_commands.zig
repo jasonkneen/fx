@@ -11,7 +11,6 @@ const model_capabilities = @import("../config/model_capabilities.zig");
 const model_provider = @import("../config/model_provider.zig");
 const output_contracts = @import("../output/output_contracts.zig");
 const permissions = @import("../permissions/permissions.zig");
-const sandbox = @import("../permissions/sandbox.zig");
 const worker_runtime = @import("../agent/worker_runtime.zig");
 const prompt_history_runtime = @import("../app/prompt_history_runtime.zig");
 const provider_runtime = @import("../app/provider_runtime.zig");
@@ -179,14 +178,12 @@ fn appendShadowedUserSources(
     try appendShadowedUserSource(writer, "prompt_history", patch.prompt_history_enabled != null, sources.prompt_history_enabled, &wrote_header);
     if (patch.statusline_item) |item| {
         const source: ?config_runtime.ConfigSource = switch (item.item) {
-            .sandbox => sources.statusline_sandbox,
             .context => sources.statusline_context,
             .session => sources.statusline_session,
             .workspace => null,
         };
         if (source) |resolved| {
             const field = switch (item.item) {
-                .sandbox => "statusLine.sandbox",
                 .context => "statusLine.context",
                 .session => "statusLine.session",
                 .workspace => unreachable,
@@ -281,10 +278,6 @@ pub fn Commands(comptime App: type) type {
                 .auth = auth,
                 .auth_help = auth.missingHelp(.interactive),
                 .permission_mode = app.permission_engine.mode,
-                .sandbox_backend = sandbox.effectiveBackend(
-                    app.permission_engine.mode,
-                    app.permission_state.sandbox_backend,
-                ),
                 .workspace_root = app.workspace_root,
                 .history_turns = app.session.historyLen(),
                 .session_permission_grants = app.permission_engine.grants.items.len,
@@ -1993,14 +1986,8 @@ test "session_commands showStatus writes session status snapshot" {
 
     app.clearTranscript();
     app.permission_engine.mode = .yolo;
-    app.permission_state.sandbox_backend = .macos;
     try Commands(FakeApp).showStatus(&app);
     try expectTranscriptContains(&app, "permission_mode=yolo\n");
-    try expectTranscriptContains(&app, "sandbox=none\n");
-    try std.testing.expectEqual(
-        sandbox.BackendKind.macos,
-        app.permission_state.sandbox_backend,
-    );
 }
 
 test "session_commands history setting toggles durable input history" {
@@ -2168,15 +2155,15 @@ test "session_commands statusline shadow notice names the preference field" {
         &out.writer,
         .{
             .statusline_item = .{
-                .item = .sandbox,
+                .item = .context,
                 .enabled = false,
             },
         },
-        .{ .statusline_sandbox = .project },
+        .{ .statusline_context = .project },
     );
 
     try std.testing.expectEqualStrings(
-        "; fresh sessions here use higher-precedence statusLine.sandbox=project",
+        "; fresh sessions here use higher-precedence statusLine.context=project",
         out.written(),
     );
 }

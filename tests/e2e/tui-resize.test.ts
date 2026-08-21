@@ -2449,7 +2449,7 @@ describe.skipIf(SKIP)("tui: resize", () => {
       await session.waitForText("/help", 10_000);
       await waitForSelectedSlashLabel(session, "/help");
       const shrinkStage = await session.captureFullScrollback();
-      expect(shrinkStage).toContain("Commands 40 · Type to filter");
+      expect(shrinkStage).toContain("Commands 38 · Type to filter");
       expect(shrinkStage).toContain("1–4");
       writeFileSync(join(root, "scrollback-after-shrink.txt"), shrinkStage);
 
@@ -2608,10 +2608,7 @@ describe.skipIf(SKIP)("tui: resize", () => {
         await active.sendText("/statusline");
         await active.waitForText("Status line", TIMEOUT);
         await active.sendKeys("Right");
-        await active.waitForText(
-          process.platform === "darwin" ? "sandbox:os" : "sandbox:none",
-          TIMEOUT,
-        );
+        await active.waitForText("off  on", TIMEOUT);
         await active.sendKeys("Down");
         await active.sendKeys("Right");
       },
@@ -2641,19 +2638,6 @@ describe.skipIf(SKIP)("tui: resize", () => {
         await active.resizeWindow(60, 12, 500);
         await active.sendText("/help");
         await active.waitForText("Commands ", TIMEOUT);
-      },
-    },
-    {
-      issue: "FXC-123",
-      label: "sandbox",
-      width: 120,
-      height: 36,
-      surfaceMarker: "Command sandbox",
-      editedInput: "x",
-      async openSurface(active) {
-        await active.sendText("/sandbox");
-        await active.waitForText("Command sandbox", TIMEOUT);
-        await active.resizeWindow(60, 12, 500);
       },
     },
     {
@@ -3472,11 +3456,11 @@ describe.skipIf(SKIP)("tui: resize", () => {
     async () => {
       session = await launchAt(120, 40);
       await session.sendText("/help");
-      await session.waitForText("Commands 40", 5_000);
+      await session.waitForText("Commands 38", 5_000);
       await session.resizeWindow(76, 24, 400);
 
       const grid = await session.capturePaneGrid();
-      expect(grid.join("\n")).toContain("Commands 40");
+      expect(grid.join("\n")).toContain("Commands 38");
       expect(findHelpScreen(grid)).not.toBeNull();
 
       await session.sendKeys("Escape");
@@ -3494,7 +3478,7 @@ describe.skipIf(SKIP)("tui: resize", () => {
     async () => {
       session = await launchAt(120, 40);
       await session.sendText("/help");
-      await session.waitForText("Commands 40", 5_000);
+      await session.waitForText("Commands 38", 5_000);
 
       const captureScrollback = () =>
         execSync(`tmux capture-pane -t ${session!.name} -p -S -`, {
@@ -3502,7 +3486,7 @@ describe.skipIf(SKIP)("tui: resize", () => {
           stdio: "pipe",
         });
       const expectHelpCatalog = (grid: string[]) => {
-        expect(grid.join("\n")).toContain("Commands 40");
+        expect(grid.join("\n")).toContain("Commands 38");
         expect(grid.join("\n")).not.toContain("Run /help for commands");
         expect(findHelpScreen(grid)).not.toBeNull();
       };
@@ -3518,7 +3502,7 @@ describe.skipIf(SKIP)("tui: resize", () => {
       const restored = captureScrollback();
       expect(restored.match(/𝒇x v\d+\.\d+\.\d+\b/g)).toHaveLength(1);
       expect(restored.match(/Run \/help for commands/g)).toHaveLength(1);
-      expect(restored).not.toContain("Commands 40");
+      expect(restored).not.toContain("Commands 38");
       expect(findFooter(await session.capturePaneGrid())).not.toBeNull();
     },
     TIMEOUT,
@@ -3572,7 +3556,6 @@ describe.skipIf(SKIP)("tui: resize", () => {
           FX_TRACE_SCOPES:
             "frame_schedule,frame_plan,frame_diff,frame_commit,scroll,resize,input,worker",
           NO_COLOR: "1",
-          TMUX: undefined,
         },
       });
       await session.waitForComposer(10_000);
@@ -3589,35 +3572,37 @@ describe.skipIf(SKIP)("tui: resize", () => {
 
       const beforeResizeLine = readTraceLines(tracePath).length - 1;
       const beforeResizeFrame = readTapeFrames(tapePath).length;
+      const paneTty = execFileSync(
+        "tmux",
+        ["display-message", "-p", "-t", session.name, "#{pane_tty}"],
+        { encoding: "utf8", stdio: "pipe" },
+      ).trim();
+      // Drift the terminal position without updating fx's shadow grid. Tmux
+      // can then answer the resize probe while reconciliation is still blocked.
+      writeFileSync(paneTty, "\x1b[3A");
       await session.resizeWindow(120, 40, 0);
       execFileSync("tmux", ["send-keys", "-t", session.name, "-l", "x"], {
         stdio: "pipe",
       });
 
-      const requestedTrace = await waitForTraceText(
+      const resizeCycle = await waitForResizeCycle(
         tracePath,
-        "cursor_measure_requested protocol=private",
-        30_000,
-        5,
-      );
-      const requestLine = requestedTrace
-        .split("\n")
-        .findLast((line) => line.includes("cursor_measure_requested protocol=private"));
-      expect(requestLine).toBeDefined();
-      const expectedRow = signedTraceField(requestLine!, "expected_reflow_row");
-      expect(expectedRow).toBeGreaterThan(3);
-      const actualRow = expectedRow - 3;
-      sendRawTmuxBytes(
-        session,
-        "prepaint-cursor-reply",
-        Buffer.from(`\x1b[?${actualRow};1R\x1b[?${actualRow};2R`),
-      );
-
-      await waitForTraceText(
-        tracePath,
-        "history_row_delta=3 valid=true",
+        beforeResizeLine,
+        (cycle) =>
+          cycle.newSize.cols === 120 &&
+          cycle.newSize.rows === 40 &&
+          cycle.historyRowDelta !== 0,
         60_000,
       );
+      expect(resizeCycle.historyRowDelta).not.toBe(0);
+      const requestLine = readTraceLines(tracePath).find(
+        (line, index) =>
+          index > beforeResizeLine &&
+          line.includes("cursor_measure_requested protocol=ansi_tagged"),
+      );
+      expect(requestLine).toBeDefined();
+      expect(signedTraceField(requestLine!, "expected_reflow_row"))
+        .toBeGreaterThan(3);
       await waitForTraceText(tracePath, "settled_reset_committed");
       const finalGrid = await session.capturePaneGrid();
       const finalFooter = findFooter(finalGrid);
@@ -4031,7 +4016,7 @@ describe.skipIf(SKIP)("tui: resize", () => {
         expect(await session.captureFullScrollback()).toContain(marker);
 
         await session.sendText("/help");
-        await session.waitForText("Commands 40", 5_000);
+        await session.waitForText("Commands 38", 5_000);
         await session.resizeWindow(84, 28, 500);
 
         const catalog = await session.capturePaneGrid();
@@ -4046,7 +4031,7 @@ describe.skipIf(SKIP)("tui: resize", () => {
         expect(scrollback.match(/𝒇x v\d+\.\d+\.\d+\b/g)).toHaveLength(1);
         expect(scrollback.match(/Run \/help for commands/g)).toHaveLength(1);
         expect(scrollback.split("\n")[0]).toMatch(/𝒇x v\d+\.\d+\.\d+\b/);
-        expect(scrollback).not.toContain("Commands 40");
+        expect(scrollback).not.toContain("Commands 38");
         const finalGrid = await session.capturePaneGrid();
         expect(findFooter(finalGrid), finalGrid.join("\n")).not.toBeNull();
 

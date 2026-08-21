@@ -5,7 +5,6 @@ const background_store = @import("../background/background_store.zig");
 const doctor_runtime = @import("../cli/doctor_runtime.zig");
 const model_provider = @import("../config/model_provider.zig");
 const permissions = @import("../permissions/permissions.zig");
-const sandbox = @import("../permissions/sandbox.zig");
 const session_display_metadata = @import("../session/session_display_metadata.zig");
 const session_json = @import("../session/session_json.zig");
 const session_store = @import("../session/session_store.zig");
@@ -363,11 +362,15 @@ fn writeTerminalSafe(writer: *std.Io.Writer, alloc: Allocator, raw: []const u8) 
 
 fn gatewayProviderConnected(auth: auth_runtime.StatusSnapshot) bool {
     const source = auth.active_source orelse return auth.gateway_connected;
-    return auth.gateway_connected or source != .chatgpt_subscription;
+    return auth.gateway_connected or (source != .chatgpt_subscription and source != .grok_subscription);
 }
 
 fn chatGptProviderConnected(auth: auth_runtime.StatusSnapshot) bool {
     return auth.chatgpt_connected or auth.active_source == .chatgpt_subscription;
+}
+
+fn grokProviderConnected(auth: auth_runtime.StatusSnapshot) bool {
+    return auth.grok_connected or auth.active_source == .grok_subscription;
 }
 
 fn writeConnectedProvidersText(writer: *std.Io.Writer, auth: auth_runtime.StatusSnapshot) !void {
@@ -379,6 +382,11 @@ fn writeConnectedProvidersText(writer: *std.Io.Writer, auth: auth_runtime.Status
     if (chatGptProviderConnected(auth)) {
         if (wrote_provider) try writer.writeAll(", Codex");
         if (!wrote_provider) try writer.writeAll("Codex");
+        wrote_provider = true;
+    }
+    if (grokProviderConnected(auth)) {
+        if (wrote_provider) try writer.writeAll(", Grok");
+        if (!wrote_provider) try writer.writeAll("Grok");
         wrote_provider = true;
     }
     if (!wrote_provider) try writer.writeAll("none");
@@ -394,7 +402,6 @@ pub const StatusSnapshot = struct {
     auth_help: ?[]const u8 = null,
     mcp_config_error: ?[]const u8 = null,
     permission_mode: types.PermissionMode,
-    sandbox_backend: sandbox.BackendKind = .none,
     workspace_root: []const u8,
     history_turns: usize,
     session_permission_grants: usize,
@@ -412,7 +419,7 @@ pub const StatusSnapshot = struct {
         defer out.deinit();
 
         try out.writer.print("[status] model={s}\n", .{self.model});
-        if (self.provider == .codex) {
+        if (self.provider != .gateway) {
             try out.writer.print("[status] model_source={s}\n", .{model_provider.label(self.provider)});
         }
         try out.writer.print("[status] update_channel={s}\n", .{self.update_channel});
@@ -424,7 +431,7 @@ pub const StatusSnapshot = struct {
             try out.writer.print("[status] mcp_config_error={s}\n", .{error_name});
         }
         try out.writer.print("[status] auth={s}\n", .{self.auth.activeSourceLabel()});
-        if (self.provider == .codex) {
+        if (self.provider != .gateway) {
             try out.writer.writeAll("[status] connected_providers=");
             try writeConnectedProvidersText(&out.writer, self.auth);
             try out.writer.writeByte('\n');
@@ -438,7 +445,6 @@ pub const StatusSnapshot = struct {
             try out.writer.print("[status] team={s}\n", .{team});
         }
         try out.writer.print("[status] permission_mode={s}\n", .{permissionModeLabel(self.permission_mode)});
-        try out.writer.print("[status] sandbox={s}\n", .{sandbox.publicModeForBackend(self.sandbox_backend).label()});
         try out.writer.print("[status] workspace={s}\n", .{self.workspace_root});
         try out.writer.print("[status] history_turns={d}\n", .{self.history_turns});
         try out.writer.print("[status] session_permission_grants={d}\n", .{self.session_permission_grants});
@@ -451,7 +457,7 @@ pub const StatusSnapshot = struct {
         defer out.deinit();
 
         try out.writer.print("model={s}\n", .{self.model});
-        if (self.provider == .codex) {
+        if (self.provider != .gateway) {
             try out.writer.print("model_source={s}\n", .{model_provider.label(self.provider)});
         }
         try out.writer.print("update_channel={s}\n", .{self.update_channel});
@@ -460,7 +466,7 @@ pub const StatusSnapshot = struct {
             try out.writer.print("build_revision={s}\n", .{self.build_revision});
         }
         try out.writer.print("auth={s}\n", .{self.auth.activeSourceLabel()});
-        if (self.provider == .codex) {
+        if (self.provider != .gateway) {
             try out.writer.writeAll("connected_providers=");
             try writeConnectedProvidersText(&out.writer, self.auth);
             try out.writer.writeByte('\n');
@@ -470,7 +476,6 @@ pub const StatusSnapshot = struct {
         if (self.auth_help) |help| try out.writer.print("auth_help={s}\n", .{help});
         if (self.auth.team) |team| try out.writer.print("team={s}\n", .{team});
         try out.writer.print("permission_mode={s}\n", .{permissionModeLabel(self.permission_mode)});
-        try out.writer.print("sandbox={s}\n", .{sandbox.publicModeForBackend(self.sandbox_backend).label()});
         try out.writer.print("workspace={s}\n", .{self.workspace_root});
         try out.writer.print("history_turns={d}\n", .{self.history_turns});
         try out.writer.print("session_permission_grants={d}\n", .{self.session_permission_grants});
@@ -489,7 +494,7 @@ pub const StatusSnapshot = struct {
     pub fn writeJson(self: StatusSnapshot, writer: *std.Io.Writer) !void {
         try writer.writeAll("{\"kind\":\"status\",\"model\":");
         try std.json.Stringify.value(self.model, .{}, writer);
-        if (self.provider == .codex) {
+        if (self.provider != .gateway) {
             try writer.writeAll(",\"model_source\":");
             try std.json.Stringify.value(model_provider.label(self.provider), .{}, writer);
         }
@@ -505,7 +510,7 @@ pub const StatusSnapshot = struct {
         }
         try writer.writeAll(",\"auth\":");
         try std.json.Stringify.value(self.auth.activeSourceLabel(), .{}, writer);
-        if (self.provider == .codex) {
+        if (self.provider != .gateway) {
             try writer.writeAll(",\"connected_providers\":[");
             var wrote_provider = false;
             if (gatewayProviderConnected(self.auth)) {
@@ -515,6 +520,11 @@ pub const StatusSnapshot = struct {
             if (chatGptProviderConnected(self.auth)) {
                 if (wrote_provider) try writer.writeByte(',');
                 try std.json.Stringify.value("codex", .{}, writer);
+                wrote_provider = true;
+            }
+            if (grokProviderConnected(self.auth)) {
+                if (wrote_provider) try writer.writeByte(',');
+                try std.json.Stringify.value("grok", .{}, writer);
             }
             try writer.writeByte(']');
         }
@@ -530,8 +540,6 @@ pub const StatusSnapshot = struct {
         }
         try writer.writeAll(",\"permission_mode\":");
         try std.json.Stringify.value(permissionModeLabel(self.permission_mode), .{}, writer);
-        try writer.writeAll(",\"sandbox\":");
-        try std.json.Stringify.value(sandbox.publicModeForBackend(self.sandbox_backend).label(), .{}, writer);
         try writer.writeAll(",\"workspace\":");
         try std.json.Stringify.value(self.workspace_root, .{}, writer);
         try writer.print(",\"history_turns\":{d}", .{self.history_turns});
@@ -666,7 +674,7 @@ pub const ModelListSnapshot = struct {
 
         const shown = self.shownCount();
         for (self.ids[0..shown]) |id| {
-            if (self.provider == .codex) {
+            if (self.provider != .gateway) {
                 try out.writer.print(" - {s} · {s}\n", .{ id, model_provider.label(self.provider) });
             } else {
                 try out.writer.print(" - {s}\n", .{id});
@@ -694,7 +702,7 @@ pub const ModelListSnapshot = struct {
         try out.writer.print("{d} available", .{self.ids.len});
         const shown = self.shownCount();
         for (self.ids[0..shown]) |id| {
-            if (self.provider == .codex) {
+            if (self.provider != .gateway) {
                 try out.writer.print("\n - {s} · {s}", .{ id, model_provider.label(self.provider) });
             } else {
                 try out.writer.print("\n - {s}", .{id});
@@ -718,7 +726,7 @@ pub const ModelListSnapshot = struct {
             if (i > 0) try out.writer.writeByte(',');
             try std.json.Stringify.value(id, .{}, &out.writer);
         }
-        if (self.provider == .codex) {
+        if (self.provider != .gateway) {
             try out.writer.writeAll("],\"models\":[");
             for (self.ids[0..shown], 0..) |id, i| {
                 if (i > 0) try out.writer.writeByte(',');
@@ -741,6 +749,7 @@ pub const ModelListSnapshot = struct {
         return switch (self.provider) {
             .gateway => "gateway",
             .codex => model_provider.label(.codex),
+            .grok => model_provider.label(.grok),
         };
     }
 
@@ -754,6 +763,7 @@ pub const ModelListSnapshot = struct {
             .credential_refresh_failed => "Vercel sign-in refresh failed; using the public model catalog.",
             .authenticated_credential_rejected => "Your Gateway credential was rejected; using the public model catalog.",
             .chatgpt_subscription => "Codex models require an authenticated Codex catalog.",
+            .grok_subscription => "Grok models require an authenticated Grok catalog.",
         };
     }
 };
@@ -1217,7 +1227,7 @@ pub const DoctorSnapshot = struct {
         );
         try out.writer.print("[doctor] workspace={s}\n", .{self.workspace_root});
         try out.writer.print("[doctor] model={s}\n", .{self.model});
-        if (self.provider == .codex) {
+        if (self.provider != .gateway) {
             try out.writer.print("[doctor] model_source={s}\n", .{model_provider.label(self.provider)});
         }
         try out.writer.print("[doctor] auth={s}\n", .{self.auth.activeSourceLabel()});
@@ -1254,7 +1264,7 @@ pub const DoctorSnapshot = struct {
         try std.json.Stringify.value(self.workspace_root, .{}, writer);
         try writer.writeAll(",\"model\":");
         try std.json.Stringify.value(self.model, .{}, writer);
-        if (self.provider == .codex) {
+        if (self.provider != .gateway) {
             try writer.writeAll(",\"model_source\":");
             try std.json.Stringify.value(model_provider.label(self.provider), .{}, writer);
         }
@@ -1959,14 +1969,14 @@ test "core status snapshot text and json stay stable" {
     const text = try snapshot.renderText(std.testing.allocator);
     defer std.testing.allocator.free(text);
     try std.testing.expectEqualStrings(
-        "[status] model=alpha\n[status] update_channel=stable\n[status] build_channel=stable\n[status] auth=missing\n[status] auth_refreshable=false\n[status] auth_help=Fx needs access to Vercel AI Gateway. Run fx login to sign in, fx setup to use an API key, or set AI_GATEWAY_API_KEY.\n[status] permission_mode=ask\n[status] sandbox=none\n[status] workspace=/tmp/fx\n[status] history_turns=3\n[status] session_permission_grants=1\n[status] agent_step_limit=24\n",
+        "[status] model=alpha\n[status] update_channel=stable\n[status] build_channel=stable\n[status] auth=missing\n[status] auth_refreshable=false\n[status] auth_help=Fx needs access to Vercel AI Gateway. Run fx login to sign in, fx setup to use an API key, or set AI_GATEWAY_API_KEY.\n[status] permission_mode=ask\n[status] workspace=/tmp/fx\n[status] history_turns=3\n[status] session_permission_grants=1\n[status] agent_step_limit=24\n",
         text,
     );
 
     const json = try snapshot.renderJson(std.testing.allocator);
     defer std.testing.allocator.free(json);
     try std.testing.expectEqualStrings(
-        "{\"kind\":\"status\",\"model\":\"alpha\",\"update_channel\":\"stable\",\"build_channel\":\"stable\",\"build_revision\":\"\",\"auth\":\"missing\",\"auth_refreshable\":false,\"auth_help\":\"Fx needs access to Vercel AI Gateway. Run fx login to sign in, fx setup to use an API key, or set AI_GATEWAY_API_KEY.\",\"permission_mode\":\"ask\",\"sandbox\":\"none\",\"workspace\":\"/tmp/fx\",\"history_turns\":3,\"session_permission_grants\":1,\"agent_step_limit\":24}",
+        "{\"kind\":\"status\",\"model\":\"alpha\",\"update_channel\":\"stable\",\"build_channel\":\"stable\",\"build_revision\":\"\",\"auth\":\"missing\",\"auth_refreshable\":false,\"auth_help\":\"Fx needs access to Vercel AI Gateway. Run fx login to sign in, fx setup to use an API key, or set AI_GATEWAY_API_KEY.\",\"permission_mode\":\"ask\",\"workspace\":\"/tmp/fx\",\"history_turns\":3,\"session_permission_grants\":1,\"agent_step_limit\":24}",
         json,
     );
 }
@@ -1985,14 +1995,14 @@ test "core status snapshot includes selected team when present" {
     const text = try snapshot.renderText(std.testing.allocator);
     defer std.testing.allocator.free(text);
     try std.testing.expectEqualStrings(
-        "[status] model=alpha\n[status] update_channel=stable\n[status] build_channel=stable\n[status] auth=fx login\n[status] auth_refreshable=true\n[status] team=example-team\n[status] permission_mode=ask\n[status] sandbox=none\n[status] workspace=/tmp/fx\n[status] history_turns=0\n[status] session_permission_grants=0\n[status] agent_step_limit=24\n",
+        "[status] model=alpha\n[status] update_channel=stable\n[status] build_channel=stable\n[status] auth=fx login\n[status] auth_refreshable=true\n[status] team=example-team\n[status] permission_mode=ask\n[status] workspace=/tmp/fx\n[status] history_turns=0\n[status] session_permission_grants=0\n[status] agent_step_limit=24\n",
         text,
     );
 
     const json = try snapshot.renderJson(std.testing.allocator);
     defer std.testing.allocator.free(json);
     try std.testing.expectEqualStrings(
-        "{\"kind\":\"status\",\"model\":\"alpha\",\"update_channel\":\"stable\",\"build_channel\":\"stable\",\"build_revision\":\"\",\"auth\":\"fx login\",\"auth_refreshable\":true,\"team\":\"example-team\",\"permission_mode\":\"ask\",\"sandbox\":\"none\",\"workspace\":\"/tmp/fx\",\"history_turns\":0,\"session_permission_grants\":0,\"agent_step_limit\":24}",
+        "{\"kind\":\"status\",\"model\":\"alpha\",\"update_channel\":\"stable\",\"build_channel\":\"stable\",\"build_revision\":\"\",\"auth\":\"fx login\",\"auth_refreshable\":true,\"team\":\"example-team\",\"permission_mode\":\"ask\",\"workspace\":\"/tmp/fx\",\"history_turns\":0,\"session_permission_grants\":0,\"agent_step_limit\":24}",
         json,
     );
 }

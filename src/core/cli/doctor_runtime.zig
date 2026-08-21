@@ -6,7 +6,6 @@ const agent_steps = @import("../config/agent_steps.zig");
 const config_runtime = @import("../config/config_runtime.zig");
 const host = @import("../hosts/host.zig");
 const mcp_contract = @import("../mcp/mcp_contract.zig");
-const sandbox = @import("../permissions/sandbox.zig");
 const session_store = @import("../session/session_store.zig");
 const types = @import("../shared/types.zig");
 const model_provider = @import("../config/model_provider.zig");
@@ -127,6 +126,7 @@ pub fn collect(
         .model = switch (snapshot.provider) {
             .gateway => detailed.settings.model,
             .codex => detailed.settings.codex_model,
+            .grok => detailed.settings.grok_model,
         },
         .permission_mode = detailed.settings.permission_mode,
         .max_agent_steps = detailed.settings.max_agent_steps,
@@ -243,7 +243,7 @@ fn appendConfigLoadFailureCheck(checks: *std.ArrayList(Check), alloc: Allocator,
 }
 
 fn formatConfigLoadFailure(alloc: Allocator, prefix: []const u8, err: anyerror) ![]u8 {
-    return std.fmt.allocPrint(alloc, "{s}: {s}", .{ prefix, sandbox.configErrorMessage(err) orelse @errorName(err) });
+    return std.fmt.allocPrint(alloc, "{s}: {s}", .{ prefix, @errorName(err) });
 }
 
 fn appendStateChecks(checks: *std.ArrayList(Check), alloc: Allocator, workspace_root: []const u8) !void {

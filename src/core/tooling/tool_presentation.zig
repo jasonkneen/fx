@@ -137,25 +137,6 @@ pub fn formatRunCommandPermissionLabel(
     return std.fmt.allocPrint(alloc, "terminal.exec {s}{s}", .{ encoded.bytes, suffix });
 }
 
-/// The caller owns the returned allocation and must free it with `alloc`.
-pub fn formatSandboxWideningPermissionLabel(
-    alloc: Allocator,
-    reactive: bool,
-    command: []const u8,
-) ![]const u8 {
-    var scratch_state = std.heap.ArenaAllocator.init(alloc);
-    defer scratch_state.deinit();
-    const encoded = try text_utils.encodeTerminalSafe(
-        scratch_state.allocator(),
-        command,
-        max_run_command_activity_bytes,
-    );
-    return std.fmt.allocPrint(alloc, "{s}broader file access: {s}", .{
-        if (reactive) "retry with " else "",
-        encoded.bytes,
-    });
-}
-
 pub fn isAdvertisedDynamicMcpName(registry: tool_dispatch.Registry, name: []const u8, advertised: []const []const u8) bool {
     if (registry.lookup(name) != null) return false;
     for (advertised) |advertised_name| {
@@ -842,21 +823,6 @@ test "tool presentation bounds a large multiline run command activity" {
     try std.testing.expect(std.mem.find(u8, label, "\\x0d") == null);
     try std.testing.expect(std.unicode.utf8ValidateSlice(label));
     try std.testing.expect(std.mem.endsWith(u8, label, "..."));
-}
-
-test "sandbox widening permission label bounds oversized commands" {
-    const alloc = std.testing.allocator;
-    const oversized = "x" ** 5_000;
-    const label = try formatSandboxWideningPermissionLabel(alloc, true, oversized);
-    defer alloc.free(label);
-
-    try std.testing.expect(std.mem.startsWith(u8, label, "retry with broader file access: "));
-    try std.testing.expect(label.len <= 160);
-    try std.testing.expect(std.mem.endsWith(u8, label, "..."));
-
-    const short = try formatSandboxWideningPermissionLabel(alloc, false, "npm install");
-    defer alloc.free(short);
-    try std.testing.expectEqualStrings("broader file access: npm install", short);
 }
 
 test "tool presentation formats permission labels" {

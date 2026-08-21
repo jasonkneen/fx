@@ -425,8 +425,8 @@ fn streamAgentCompletion(
     alloc: Allocator,
     request: agent_stream_provider_contract.Request,
 ) anyerror!agent_stream_provider_contract.Result {
-    if (request.credential_source == .chatgpt_subscription) {
-        return error.CodexCredentialCannotAuthorizeGateway;
+    if (request.credential_source == .chatgpt_subscription or request.credential_source == .grok_subscription) {
+        return error.SubscriptionCredentialCannotAuthorizeGateway;
     }
     const result = gateway_client.streamGatewayCompletion(
         alloc,
@@ -483,6 +483,9 @@ fn fetchCredits(
 ) output_contracts.CreditsSnapshot {
     if (input.credential_source == .chatgpt_subscription) {
         return creditsErrorSnapshot(alloc, "AI Gateway credits are unavailable for a ChatGPT subscription.");
+    }
+    if (input.credential_source == .grok_subscription) {
+        return creditsErrorSnapshot(alloc, "AI Gateway credits are unavailable for a Grok subscription.");
     }
     return fetchCreditsWithFetch(
         alloc,
@@ -626,7 +629,12 @@ const OAuthHttpOperation = struct {
                 },
                 .user_agent = .{ .override = gateway_client.user_agent },
                 .accept_encoding = .omit,
+                .authorization = if (self.request.authorization) |value|
+                    .{ .override = value }
+                else
+                    .default,
             },
+            .redirect_behavior = .unhandled,
             .response_writer = &response_writer,
         }) catch |err| switch (err) {
             error.WriteFailed => return error.OAuthResponseTooLarge,

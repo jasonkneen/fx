@@ -1914,7 +1914,6 @@ pub const CapabilityPolicy = struct {
 pub fn captureHostAuthority(
     alloc: Allocator,
     policy: CapabilityPolicy,
-    sandbox_backend: types.BackendKind,
     integration_names: []const []const u8,
     rules: types.PermissionRuleSet,
     grants: []const types.PermissionGrant,
@@ -1922,7 +1921,6 @@ pub fn captureHostAuthority(
     return captureHostAuthorityWithMcpView(
         alloc,
         policy,
-        sandbox_backend,
         integration_names,
         rules,
         grants,
@@ -1934,7 +1932,6 @@ pub fn captureHostAuthority(
 pub fn captureHostAuthorityWithMcpView(
     alloc: Allocator,
     policy: CapabilityPolicy,
-    sandbox_backend: types.BackendKind,
     integration_names: []const []const u8,
     rules: types.PermissionRuleSet,
     grants: []const types.PermissionGrant,
@@ -1951,7 +1948,6 @@ pub fn captureHostAuthorityWithMcpView(
     return authority.HostAuthority.captureWithPermissionStateAndMcpView(
         alloc,
         tool_names.items,
-        sandbox_backend,
         integration_names,
         rules,
         grants,
@@ -2022,7 +2018,6 @@ test "host authority capture applies explicit mode and permission capability pol
     var full = try captureHostAuthority(
         std.testing.allocator,
         .{ .tool_set = tool_set, .mode = .full },
-        .none,
         &.{},
         .{},
         &.{},
@@ -2048,7 +2043,6 @@ test "host authority capture applies explicit mode and permission capability pol
             .tool_set = tool_set,
             .mode = .{ .active = .{ .registry = registry, .id = "inspect" } },
         },
-        .macos,
         &.{"mcp__example"},
         .{ .rules = rules[0..] },
         grants[0..],
@@ -2056,7 +2050,6 @@ test "host authority capture applies explicit mode and permission capability pol
     defer restricted.deinit(std.testing.allocator);
     try std.testing.expectEqual(@as(usize, 1), restricted.tools.len);
     try std.testing.expectEqualStrings("inspect", restricted.tools[0]);
-    try std.testing.expectEqual(types.BackendKind.macos, restricted.sandbox_backend);
     try std.testing.expectEqualStrings("mcp__example", restricted.integrations[0]);
     try std.testing.expectEqualStrings("list", restricted.rules.rules[0].permission);
     try std.testing.expectEqualStrings("inspect", restricted.grants[0].tool_name);
@@ -2410,7 +2403,6 @@ fn captureAdmission(
         .provider = request.preferences.provider,
         .effort = request.preferences.effort,
         .permission_mode = snapshot.permission_mode,
-        .sandbox_backend = snapshot.sandbox_backend,
         .tool_names = snapshot.tools,
         .rules = snapshot.rules,
         .grants = snapshot.grants,
@@ -2722,7 +2714,6 @@ test "independent processes receive distinct authoritative operation identities"
 const TestAuthority = struct {
     root_id: []const u8,
     tools: []const []const u8 = &.{"subagent"},
-    sandbox_backend: types.BackendKind = .none,
     integrations: []const []const u8 = &.{},
     rules: types.PermissionRuleSet = .{},
     grants: []const types.PermissionGrant = &.{},
@@ -2743,7 +2734,6 @@ const TestAuthority = struct {
         return authority.HostAuthority.capture(
             alloc,
             self.tools,
-            self.sandbox_backend,
             self.integrations,
             self.rules,
             self.grants,
@@ -6560,7 +6550,6 @@ test "nested children resolve the same current controlling authority" {
     var test_authority = TestAuthority{
         .root_id = root_id,
         .tools = &.{ "read_file", "subagent" },
-        .sandbox_backend = .macos,
         .integrations = &.{"mcp_old"},
         .rules = .{ .rules = &initial_rules },
         .grants = &initial_grants,
@@ -6619,7 +6608,6 @@ test "nested children resolve the same current controlling authority" {
         .target_path = @constCast("src/new.zig"),
     }};
     test_authority.tools = &.{ "write_file", "subagent" };
-    test_authority.sandbox_backend = .vercel;
     test_authority.integrations = &.{"mcp_new"};
     test_authority.rules = .{ .rules = &next_rules };
     test_authority.grants = &next_grants;
@@ -6628,7 +6616,6 @@ test "nested children resolve the same current controlling authority" {
     var current_nested = try host.authority_resolver.resolve(alloc, nested_id);
     defer current_nested.deinit(alloc);
     for ([_]authority.Snapshot{ current_parent, current_nested }) |snapshot| {
-        try std.testing.expectEqual(types.BackendKind.vercel, snapshot.sandbox_backend);
         try std.testing.expectEqual(@as(usize, 2), snapshot.tools.len);
         try std.testing.expectEqualStrings("write_file", snapshot.tools[0]);
         try std.testing.expectEqual(@as(usize, 1), snapshot.integrations.len);

@@ -355,9 +355,6 @@ pub fn Bindings(comptime App: type) type {
                     );
                 }
             }
-            if (comptime @hasDecl(App, "requestSandboxWideningSyncWithAdvertised")) {
-                deps.request_sandbox_widening = agentRequestSandboxWidening;
-            }
             return deps;
         }
 
@@ -626,30 +623,6 @@ pub fn Bindings(comptime App: type) type {
         fn agentRequestPreparedFileMutationPermission(ctx: *anyopaque, arena: Allocator, call: ToolCall, prepared: *tool_admission.PreparedFileMutationCall, review_turn: permission_auto_classifier.ReviewTurnContext, permission_mode: PermissionMode, local_grants: []const PermissionGrant, live_authority: ?agent_runtime.LiveToolAuthority, advertised_dynamic_tool_names: []const []const u8) !command_admission.PermissionOutcome {
             const app: *App = @ptrCast(@alignCast(ctx));
             return app.requestPreparedFileMutationPermissionSyncWithAdvertised(arena, call, prepared, review_turn, permission_mode, local_grants, live_authority, advertised_dynamic_tool_names);
-        }
-
-        fn agentRequestSandboxWidening(
-            ctx: *anyopaque,
-            arena: Allocator,
-            call: ToolCall,
-            review_turn: permission_auto_classifier.ReviewTurnContext,
-            permission_mode: PermissionMode,
-            local_grants: []const PermissionGrant,
-            live_authority: ?agent_runtime.LiveToolAuthority,
-            advertised_dynamic_tool_names: []const []const u8,
-            required: agent_runtime.SandboxScopeRequired,
-        ) !command_admission.PermissionOutcome {
-            const app: *App = @ptrCast(@alignCast(ctx));
-            return app.requestSandboxWideningSyncWithAdvertised(
-                arena,
-                call,
-                review_turn,
-                permission_mode,
-                local_grants,
-                live_authority,
-                advertised_dynamic_tool_names,
-                required,
-            );
         }
 
         fn agentValidateToolCall(ctx: *anyopaque, arena: Allocator, call: ToolCall) !agent_runtime.ToolCallValidationResult {

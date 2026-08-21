@@ -630,6 +630,128 @@ function startAcpFakeCodex(options: {
   };
 }
 
+function writeSeededAcpGrokLogin(home: string, accessToken: string): void {
+  const fxDir = join(home, ".fx");
+  mkdirSync(fxDir, { recursive: true, mode: 0o700 });
+  chmodSync(fxDir, 0o700);
+  const authPath = join(fxDir, "grok-auth.json");
+  writeFileSync(authPath, JSON.stringify({
+    version: 1,
+    access_token: accessToken,
+    refresh_token: "grok-refresh",
+    expires_at_ms: Date.now() + 60 * 60 * 1000,
+    account_id: "acct_grok_acp",
+  }) + "\n", { mode: 0o600 });
+  chmodSync(authPath, 0o600);
+}
+
+function acpGrokSubscriptionModel(id: string, contextWindow: number) {
+  return {
+    id,
+    model: id,
+    api_backend: "responses",
+    context_window: contextWindow,
+    supports_reasoning_effort: false,
+    reasoning_efforts: [],
+  };
+}
+
+function acpGrokModalityModel(id: string) {
+  return {
+    id,
+    input_modalities: ["text", "image"],
+    output_modalities: ["text"],
+  };
+}
+
+function startAcpFakeGrok(options: {
+  unauthorizedResponses?: number;
+  route?: (body: string) => string | Promise<string>;
+} = {}) {
+  const accessToken = "grok-acp-stale";
+  const refreshedAccessToken = "grok-acp-fresh";
+  const requests: Array<{
+    path: string;
+    authorization: string | null;
+    body: string;
+    conversationId: string | null;
+    tokenAuth: string | null;
+    authenticateResponse: string | null;
+    clientIdentifier: string | null;
+    clientVersion: string | null;
+    modelOverride: string | null;
+    grokUserId: string | null;
+  }> = [];
+  const modelRequests: Array<{ path: string; authorization: string | null }> = [];
+  const tokenRequests: Array<{ path: string; authorization: string | null; body: string }> = [];
+  const userinfoRequests: Array<{ path: string; authorization: string | null }> = [];
+  let unauthorizedResponses = options.unauthorizedResponses ?? 0;
+  const server = Bun.serve({
+    hostname: "127.0.0.1",
+    port: 0,
+    async fetch(request) {
+      const path = new URL(request.url).pathname;
+      const authorization = request.headers.get("authorization");
+      if (path === "/models") {
+        modelRequests.push({ path, authorization });
+        return Response.json({ data: [acpGrokSubscriptionModel("grok-4.20", 1_000_000)] });
+      }
+      if (path === "/modalities") {
+        modelRequests.push({ path, authorization });
+        return Response.json({ models: [acpGrokModalityModel("grok-4.20")] });
+      }
+      if (path === "/token") {
+        const body = await request.text();
+        tokenRequests.push({ path, authorization, body });
+        return Response.json({
+          access_token: refreshedAccessToken,
+          refresh_token: "grok-refresh-next",
+          expires_in: 3600,
+        });
+      }
+      if (path === "/userinfo") {
+        userinfoRequests.push({ path, authorization });
+        return Response.json({ sub: "acct_grok_acp" });
+      }
+      const body = await request.text();
+      requests.push({
+        path,
+        authorization,
+        body,
+        conversationId: request.headers.get("x-grok-conv-id"),
+        tokenAuth: request.headers.get("x-xai-token-auth"),
+        authenticateResponse: request.headers.get("x-authenticateresponse"),
+        clientIdentifier: request.headers.get("x-grok-client-identifier"),
+        clientVersion: request.headers.get("x-grok-client-version"),
+        modelOverride: request.headers.get("x-grok-model-override"),
+        grokUserId: request.headers.get("x-grok-user-id"),
+      });
+      if (unauthorizedResponses > 0) {
+        unauthorizedResponses -= 1;
+        return Response.json({ error: { message: "expired" } }, { status: 401 });
+      }
+      return new Response(options.route ? await options.route(body) : codexFinalText("ACP_GROK_RESPONSE"), {
+        headers: { "content-type": "text/event-stream" },
+      });
+    },
+  });
+  const base = `http://127.0.0.1:${server.port}`;
+  return {
+    accessToken,
+    refreshedAccessToken,
+    requests,
+    modelRequests,
+    tokenRequests,
+    userinfoRequests,
+    responsesUrl: `${base}/responses`,
+    modelsUrl: `${base}/models`,
+    modalitiesUrl: `${base}/modalities`,
+    tokenUrl: `${base}/token`,
+    userinfoUrl: `${base}/userinfo`,
+    stop() { server.stop(true); },
+  };
+}
+
 class AcpReadTimeoutError extends Error {
   constructor() {
     super("ACP readLine timeout");
@@ -7070,6 +7192,118 @@ describe("acp: model-independent", () => {
   );
 
   test(
+    "ACP persistent Grok children retain their provider across messages",
+    async () => {
+      const root = createIsolatedRoot("fx-acp-grok-subagent-");
+      const gateway = startFakeGateway([]);
+      const childFirstPrompt = "GROK_CHILD_FIRST_TURN";
+      const childSecondPrompt = "GROK_CHILD_SECOND_TURN";
+      let childId = "";
+      const grok = startAcpFakeGrok({
+        route(body) {
+          const toolResult = codexLatestToolResult(body);
+          if (toolResult?.callId === "grok_child_resume") {
+            return codexFinalText("GROK_PARENT_RESUMED_CHILD");
+          }
+          if (toolResult?.callId === "grok_child_message") {
+            if (!childId) throw new Error("Grok child id was not captured");
+            return codexToolCall("grok_child_resume", "subagent", {
+              command: { lifecycle: { id: childId, action: "resume" } },
+            });
+          }
+          if (toolResult?.callId === "grok_child_create") {
+            const created = JSON.parse(toolResult.output) as { child_id: string; status: string };
+            expect(created.status).toBe("created");
+            childId = created.child_id;
+            return codexFinalText("GROK_PARENT_CREATED_CHILD");
+          }
+          if (body.includes("Send the persistent Grok child another message.")) {
+            if (!childId) throw new Error("Grok child id was not captured");
+            return codexToolCall("grok_child_message", "subagent", {
+              command: { message: { send: { id: childId, content: childSecondPrompt } } },
+            });
+          }
+          if (body.includes(childSecondPrompt)) return codexFinalText("GROK_CHILD_SECOND_DONE");
+          if (body.includes(childFirstPrompt)) return codexFinalText("GROK_CHILD_FIRST_DONE");
+          return codexToolCall("grok_child_create", "subagent", {
+            command: { create: {
+              name: "grok-persistent-child",
+              mode: "persistent",
+              prompt: childFirstPrompt,
+            } },
+          });
+        },
+      });
+      writeSeededAcpGrokLogin(root.home, grok.accessToken);
+      try {
+        client = await AcpClient.create({
+          cwd: root.workspace,
+          env: {
+            ...fakeGatewayEnv(root, gateway),
+            FX_E2E_XAI_GROK_RESPONSES_URL: grok.responsesUrl,
+            FX_E2E_XAI_GROK_MODELS_URL: grok.modelsUrl,
+            FX_E2E_XAI_GROK_MODALITIES_URL: grok.modalitiesUrl,
+          },
+        });
+        await client.request("initialize", { protocolVersion: 1 }, 1);
+        await client.request("session/new", { mcpServers: [] }, 2);
+        await client.readLine();
+        await client.request("session/set_mode", { modeId: "code" }, 3);
+        const changed = await client.request("session/set_config_option", {
+          configId: "provider",
+          value: "grok",
+        }, 4) as any;
+        expect(changed.result.configOptions.find((option: any) => option.id === "provider").currentValue)
+          .toBe("grok");
+
+        const first = await runPrompt(client, "Create a persistent Grok child.", TIMEOUT);
+        expect(first.promptResult.result.stopReason).toBe("end_turn");
+        await waitForCondition(
+          "first Grok child turn",
+          () => childId.length > 0 && grok.requests.some((request) => request.body.includes(childFirstPrompt)),
+          TIMEOUT,
+        );
+        await waitForCondition("first Grok child idle state", () => acpSubagentState(root, childId) === "idle", TIMEOUT);
+        const childState = JSON.parse(
+          readFileSync(join(root.home, ".fx", "sessions", childId, "session.json"), "utf8"),
+        ) as { preferences: { provider: string; model: string } };
+        expect(childState.preferences.provider).toBe("grok");
+        expect(childState.preferences.model).toBe("grok-4.20");
+
+        const second = await runPrompt(client, "Send the persistent Grok child another message.", TIMEOUT);
+        expect(second.promptResult.result.stopReason).toBe("end_turn");
+        await waitForCondition(
+          "second Grok child turn",
+          () => grok.requests.some((request) => request.body.includes(childSecondPrompt)),
+          TIMEOUT,
+        );
+        await waitForCondition("second Grok child idle state", () => acpSubagentState(root, childId) === "idle", TIMEOUT);
+        expect(grok.requests.length).toBeGreaterThanOrEqual(7);
+        for (const request of grok.requests) {
+          expect(request.authorization).toBe(`Bearer ${grok.accessToken}`);
+          expect(JSON.parse(request.body).model).toBe("grok-4.20");
+          expect(request.tokenAuth).toBe("xai-grok-cli");
+          expect(request.authenticateResponse).toBe("authenticate-response");
+          expect(request.clientIdentifier).toBe("fx");
+          expect(request.clientVersion).toBe("1.0.6");
+          expect(request.modelOverride).toBe("grok-4.20");
+          expect(request.grokUserId).toBe("acct_grok_acp");
+        }
+        for (const request of [...gateway.requests, ...gateway.modelRequests]) {
+          expect(request.headers.get("authorization")).not.toContain("grok-acp-");
+        }
+        expect(client.stderr).toBe("");
+      } finally {
+        await client?.close();
+        grok.stop();
+        gateway.stop();
+        rmSync(root.root, { recursive: true, force: true });
+      }
+    },
+    TIMEOUT,
+  );
+
+  test(
     "stdin shutdown cancels a pending permission request",
     async () => {
       const root = createIsolatedRoot("fx-acp-permission-shutdown-");
@@ -7476,6 +7710,77 @@ describe.skipIf(!HAS_API_KEY)("acp: model-backed protocol", () => {
       } finally {
         await client?.close();
         codex.stop();
+        gateway.stop();
+        rmSync(root.root, { recursive: true, force: true });
+      }
+    },
+    TIMEOUT,
+  );
+
+  test(
+    "session provider changes use Grok credentials with byte-identical account-stable replay",
+    async () => {
+      const root = createIsolatedRoot("fx-acp-grok-route-");
+      const gateway = startFakeGateway([]);
+      const grok = startAcpFakeGrok({ unauthorizedResponses: 1 });
+      writeSeededAcpGrokLogin(root.home, grok.accessToken);
+      try {
+        client = await AcpClient.create({
+          cwd: root.workspace,
+          env: {
+            ...fakeGatewayEnv(root, gateway),
+            FX_E2E_XAI_GROK_RESPONSES_URL: grok.responsesUrl,
+            FX_E2E_XAI_GROK_MODELS_URL: grok.modelsUrl,
+            FX_E2E_XAI_GROK_MODALITIES_URL: grok.modalitiesUrl,
+            FX_E2E_GROK_TOKEN_URL: grok.tokenUrl,
+            FX_E2E_GROK_USERINFO_URL: grok.userinfoUrl,
+          },
+        });
+        await client.request("initialize", { protocolVersion: 1 }, 1);
+        await client.request("session/new", { mcpServers: [] }, 2);
+        await client.readLine();
+
+        const changed = await client.request("session/set_config_option", {
+          configId: "provider",
+          value: "grok",
+        }, 3) as any;
+        expect(changed.result.configOptions.find((option: any) => option.id === "provider").currentValue)
+          .toBe("grok");
+        expect(changed.result.configOptions.find((option: any) => option.id === "model").currentValue)
+          .toBe("grok-4.20");
+
+        const prompt = await runPrompt(client, "Answer directly.", TIMEOUT);
+        expect(prompt.promptResult.result.stopReason).toBe("end_turn");
+        expect(JSON.stringify(prompt.messages)).toContain("ACP_GROK_RESPONSE");
+        const secondPrompt = await runPrompt(client, "Answer again.", TIMEOUT);
+        expect(secondPrompt.promptResult.result.stopReason).toBe("end_turn");
+
+        expect(grok.requests).toHaveLength(3);
+        expect(grok.requests[0]!.body).toBe(grok.requests[1]!.body);
+        expect(grok.requests[0]!.conversationId).toBeTruthy();
+        expect(grok.requests[0]!.conversationId).toBe(grok.requests[1]!.conversationId);
+        expect(grok.modelRequests.map((request) => request.path)).toEqual(["/models", "/modalities"]);
+        expect(grok.requests[0]!.authorization).toBe(`Bearer ${grok.accessToken}`);
+        expect(grok.requests[1]!.authorization).toBe(`Bearer ${grok.refreshedAccessToken}`);
+        expect(grok.requests[2]!.authorization).toBe(`Bearer ${grok.refreshedAccessToken}`);
+        for (const request of grok.requests) {
+          expect(request.tokenAuth).toBe("xai-grok-cli");
+          expect(request.authenticateResponse).toBe("authenticate-response");
+          expect(request.clientIdentifier).toBe("fx");
+          expect(request.clientVersion).toBe("1.0.6");
+          expect(request.modelOverride).toBe("grok-4.20");
+          expect(request.grokUserId).toBe("acct_grok_acp");
+        }
+        expect(grok.tokenRequests).toHaveLength(1);
+        expect(grok.tokenRequests[0]!.body).toContain("grant_type=refresh_token");
+        expect(grok.userinfoRequests).toHaveLength(1);
+        expect(grok.userinfoRequests[0]!.authorization).toBe(`Bearer ${grok.refreshedAccessToken}`);
+        for (const request of [...gateway.requests, ...gateway.modelRequests]) {
+          expect(request.headers.get("authorization")).not.toContain("grok-acp-");
+        }
+      } finally {
+        await client?.close();
+        grok.stop();
         gateway.stop();
         rmSync(root.root, { recursive: true, force: true });
       }

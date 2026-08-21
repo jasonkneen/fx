@@ -50,11 +50,12 @@ const prompt_policy = @import("core/config/prompt_policy.zig");
 const builtin_commands = @import("builtins/commands.zig");
 const command_specs = @import("core/slash_commands/command_specs.zig");
 const builtin_context = @import("builtins/context.zig");
-const builtin_devbox = @import("builtins/devbox.zig");
 const builtin_gateway = @import("builtins/gateway.zig");
 const builtin_providers = @import("builtins/providers.zig");
 const openai_codex_models = @import("gateway/openai_codex_models.zig");
 const openai_codex_permission_reviewer = @import("gateway/openai_codex_permission_reviewer.zig");
+const xai_grok_models = @import("gateway/xai_grok_models.zig");
+const xai_grok_permission_reviewer = @import("gateway/xai_grok_permission_reviewer.zig");
 const gateway_provider = @import("core/gateway/gateway_provider.zig");
 const model_catalog = @import("core/gateway/model_catalog.zig");
 const generation_usage_provider = @import("core/session/generation_usage_provider.zig");
@@ -88,7 +89,7 @@ const subagent_agent_adapter = @import("core/subagent/agent_adapter.zig");
 const types = @import("core/shared/types.zig");
 const image_attachments = @import("core/images/image_attachments.zig");
 const permissions = @import("core/permissions/permissions.zig");
-const sandbox = @import("core/permissions/sandbox.zig");
+const command_runner = @import("core/execution/command_runner.zig");
 const command_admission = @import("core/permissions/command_admission.zig");
 const permission_auto_classifier = @import("core/permissions/auto_classifier.zig");
 const auto_classifier_context = @import("core/permissions/auto_classifier_context.zig");
@@ -389,10 +390,6 @@ const App = struct {
     const WorkerAppRuntime = app_worker_runtime.Runtime(Self);
     const WorkspaceAppRuntime = app_workspace_runtime.Runtime(Self);
 
-    fn devboxProvider(_: *Self) @import("core/execution/devbox_executor.zig").Provider {
-        return builtin_devbox.provider;
-    }
-
     pub fn contextRegistry(_: *const Self) context_contract.Registry {
         return default_context_registry;
     }
@@ -564,7 +561,6 @@ const App = struct {
     diff_entries: std.ArrayList(@import("core/output/diff.zig").DiffEntry) = .empty,
     next_diff_id: u32 = 1,
 
-    statusline_sandbox: bool = false,
     statusline_context: bool = false,
     statusline_session: bool = false,
     /// Resolved display title for the active session. App owns these bytes;
@@ -943,10 +939,6 @@ const App = struct {
 
     pub fn runLoginCommand(self: *App) !void {
         try AuthAppRuntime.runLoginCommand(self);
-    }
-
-    pub fn runProviderCommand(self: *App, target: []const u8) !void {
-        try AuthAppRuntime.runProviderCommand(self, target);
     }
 
     pub fn runLogoutCommand(self: *App, target: []const u8) !void {
@@ -1374,10 +1366,6 @@ const App = struct {
             .credential_source = gateway_credential.source,
             .account_id = account_id_copy,
             .permission_mode = self.permission_engine.mode,
-            .sandbox_backend = sandbox.effectiveBackend(
-                self.permission_engine.mode,
-                self.permission_state.sandbox_backend,
-            ),
             .history = history_copy,
             .root_user_intent_context = root_user_intent_context,
             .grants = grants_copy,
@@ -1620,6 +1608,16 @@ const App = struct {
                 else
                     null,
             },
+            .grok = .{
+                .agent_stream_provider = if (comptime host_target.is_wasm)
+                    agent_stream_provider.unavailable_provider
+                else
+                    builtin_providers.agentStream(.grok),
+                .permission_reviewer_provider = if (comptime host_profile.tools and !host_target.is_wasm)
+                    xai_grok_permission_reviewer.provider
+                else
+                    null,
+            },
         };
     }
 
@@ -1661,38 +1659,6 @@ const App = struct {
 
     pub fn requestPreparedFileMutationPermissionSyncWithAdvertised(self: *App, arena: Allocator, call: ToolCall, prepared: *tool_admission.PreparedFileMutationCall, review_turn: permission_auto_classifier.ReviewTurnContext, permission_mode: PermissionMode, local_grants: []const PermissionGrant, live_authority: ?agent_runtime.LiveToolAuthority, advertised_dynamic_tool_names: []const []const u8) !command_admission.PermissionOutcome {
         return AgentAppRuntime.requestPreparedFileMutationPermissionSync(self, arena, call, prepared, review_turn, permission_mode, local_grants, live_authority, advertised_dynamic_tool_names, &ignored_list_entries, max_list_entries, max_read_file_bytes, max_read_file_lines, max_read_file_line_len, max_command_output_bytes, builtin_gateway.retry_count, builtin_gateway.defaultChatUrl());
-    }
-
-    pub fn requestSandboxWideningSyncWithAdvertised(
-        self: *App,
-        arena: Allocator,
-        call: ToolCall,
-        review_turn: permission_auto_classifier.ReviewTurnContext,
-        permission_mode: PermissionMode,
-        local_grants: []const PermissionGrant,
-        live_authority: ?agent_runtime.LiveToolAuthority,
-        advertised_dynamic_tool_names: []const []const u8,
-        required: agent_runtime.SandboxScopeRequired,
-    ) !command_admission.PermissionOutcome {
-        return AgentAppRuntime.requestSandboxWideningSync(
-            self,
-            arena,
-            call,
-            review_turn,
-            permission_mode,
-            local_grants,
-            live_authority,
-            advertised_dynamic_tool_names,
-            required,
-            &ignored_list_entries,
-            max_list_entries,
-            max_read_file_bytes,
-            max_read_file_lines,
-            max_read_file_line_len,
-            max_command_output_bytes,
-            builtin_gateway.retry_count,
-            builtin_gateway.defaultChatUrl(),
-        );
     }
 
     pub fn validateToolCall(self: *App, arena: Allocator, call: ToolCall) !agent_runtime.ToolCallValidationResult {
@@ -2920,7 +2886,7 @@ fn mainC(c_argc: c_int, c_argv: [*][*:0]c_char, c_envp: [*:null]?[*:0]c_char) !v
 
     var cli_arg_buf: [64][:0]const u8 = undefined;
     const cli_args = if (raw_args.len <= 1) &.{} else try cliArgsFromRaw(raw_args, &cli_arg_buf);
-    if (sandbox.isForegroundSessionInvocation(cli_args)) {
+    if (command_runner.isForegroundSessionInvocation(cli_args)) {
         io_mod.setRawEnviron(raw_env);
         const process_args = argsFromRaw(raw_args);
         var threaded = std.Io.Threaded.init(processAllocator(), .{
@@ -2929,7 +2895,7 @@ fn mainC(c_argc: c_int, c_argv: [*][*:0]c_char, c_envp: [*:null]?[*:0]c_char) !v
         });
         defer threaded.deinit();
         io_mod.setIo(threaded.io());
-        try sandbox.runForegroundSessionBootstrap(cli_args);
+        try command_runner.runForegroundSessionBootstrap(cli_args);
         return;
     }
     _ = cli_surface.recordRequested(cli_args) catch {
@@ -3294,6 +3260,9 @@ fn fullEntryConfig() app_entry_runtime.Config {
         .codex_agent_stream = builtin_providers.agentStream(.codex),
         .codex_cli_model_catalog = openai_codex_models.cli_model_catalog_provider,
         .codex_model_catalog = openai_codex_models.model_catalog_provider,
+        .grok_agent_stream = builtin_providers.agentStream(.grok),
+        .grok_cli_model_catalog = xai_grok_models.cli_model_catalog_provider,
+        .grok_model_catalog = xai_grok_models.model_catalog_provider,
         .background_process_provider = background_process.provider,
         .url_opener = url_opener.native_opener,
         .secret_store = native_host.secret_store,
@@ -3313,9 +3282,9 @@ fn fullEntryConfig() app_entry_runtime.Config {
         .inspect_mcp_profile_config = builtin_mcp.inspectProfileConfig,
         .load_mcp_runtime = builtin_mcp.loadRuntime,
         .acp_runner = .{ .run_fn = runAcpServer },
-        .devbox_provider = builtin_devbox.provider,
         .permission_reviewer_provider = builtin_gateway.permission_reviewer.provider,
         .codex_permission_reviewer_provider = openai_codex_permission_reviewer.provider,
+        .grok_permission_reviewer_provider = xai_grok_permission_reviewer.provider,
     };
 }
 
@@ -3334,6 +3303,9 @@ fn localEntryConfig() app_entry_runtime.Config {
         .codex_agent_stream = builtin_providers.agentStream(.codex),
         .codex_cli_model_catalog = openai_codex_models.cli_model_catalog_provider,
         .codex_model_catalog = openai_codex_models.model_catalog_provider,
+        .grok_agent_stream = builtin_providers.agentStream(.grok),
+        .grok_cli_model_catalog = xai_grok_models.cli_model_catalog_provider,
+        .grok_model_catalog = xai_grok_models.model_catalog_provider,
         .background_process_provider = background_process.provider,
         .url_opener = url_opener.native_opener,
         .secret_store = native_host.secret_store,
@@ -3353,7 +3325,6 @@ fn localEntryConfig() app_entry_runtime.Config {
         .inspect_mcp_profile_config = builtin_mcp.inspectProfileConfig,
         .load_mcp_runtime = builtin_mcp.loadRuntime,
         .acp_runner = .{ .run_fn = runAcpServer },
-        .devbox_provider = builtin_devbox.provider,
     };
 }
 
@@ -3372,6 +3343,9 @@ fn emptyEntryConfig() app_entry_runtime.Config {
         .codex_agent_stream = builtin_providers.agentStream(.codex),
         .codex_cli_model_catalog = openai_codex_models.cli_model_catalog_provider,
         .codex_model_catalog = openai_codex_models.model_catalog_provider,
+        .grok_agent_stream = builtin_providers.agentStream(.grok),
+        .grok_cli_model_catalog = xai_grok_models.cli_model_catalog_provider,
+        .grok_model_catalog = xai_grok_models.model_catalog_provider,
         .background_process_provider = background_process.provider,
         .url_opener = url_opener.native_opener,
         .secret_store = native_host.secret_store,
@@ -3391,7 +3365,6 @@ fn emptyEntryConfig() app_entry_runtime.Config {
         .inspect_mcp_profile_config = builtin_mcp.inspectProfileConfig,
         .load_mcp_runtime = builtin_mcp.loadRuntime,
         .acp_runner = .{ .run_fn = runAcpServer },
-        .devbox_provider = builtin_devbox.provider,
     };
 }
 
@@ -3882,6 +3855,11 @@ test {
     _ = @import("gateway/openai_codex_models.zig");
     _ = @import("gateway/openai_codex.zig");
     _ = @import("gateway/openai_codex_permission_reviewer.zig");
+    _ = @import("core/auth/grok_session.zig");
+    _ = @import("core/auth/grok_oauth.zig");
+    _ = @import("gateway/xai_grok_models.zig");
+    _ = @import("gateway/xai_grok.zig");
+    _ = @import("gateway/xai_grok_permission_reviewer.zig");
     _ = credentials;
     _ = @import("core/auth/oauth.zig");
     _ = @import("core/auth/oauth_session.zig");
@@ -3901,7 +3879,6 @@ test {
     _ = @import("core/shared/message.zig");
     _ = @import("core/shared/token_estimate.zig");
     _ = @import("core/shell_command/command_effect.zig");
-    _ = @import("core/execution/devbox_executor.zig");
     _ = @import("core/execution/router.zig");
     _ = @import("core/permissions/direct_command.zig");
     _ = @import("core/permissions/auto_classifier.zig");

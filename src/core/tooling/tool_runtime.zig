@@ -29,9 +29,7 @@ const permission_prompter = @import("../permissions/permission_prompter.zig");
 const permission_request = @import("../permissions/permission_request.zig");
 const command_admission = @import("../permissions/command_admission.zig");
 const pathing = @import("../workspace/pathing.zig");
-const devbox_executor = @import("../execution/devbox_executor.zig");
 const execution_router = @import("../execution/router.zig");
-const sandbox = @import("../permissions/sandbox.zig");
 const skill_runtime = @import("../skills/skill_runtime.zig");
 const subagent_authority = @import("../subagent/authority.zig");
 const subagent_communication_store = @import("../subagent/communication_store.zig");
@@ -188,8 +186,6 @@ pub const Context = struct {
     command_timeout_started_ms: ?i64 = null,
     command_replay_capture: ?*command_replay_store.Capture = null,
     command_replay_unavailable: bool = false,
-    sandbox_backend: sandbox.BackendKind = .none,
-    devbox_provider: ?devbox_executor.Provider = null,
     tracker: ?*change_tracker.ChangeTracker = null,
     mcp_ctx: ?*anyopaque = null,
     mcp_has_tool: ?tool_mcp_runtime.HasToolFn = null,
@@ -245,7 +241,6 @@ pub const Context = struct {
             .worker = self.worker,
             .permission_prompter = self.permission_prompter,
             .background = self.background,
-            .sandbox_backend = self.sandbox_backend,
             .advertised_dynamic_tool_names = self.advertised_dynamic_tool_names,
             .mcp_runtime = mcpRuntimeCapabilities(self),
             .context_limits = self.context_limits,
@@ -270,7 +265,6 @@ pub const Context = struct {
             if (live.permission_state != null) {
                 input.session_permission_state_provider = null;
             }
-            input.sandbox_backend = live.sandbox_backend;
             input.advertised_dynamic_tool_names = live.integrations;
         }
         return input;
@@ -282,6 +276,7 @@ pub const Context = struct {
             return permission_auto_classifier.Classifier.disabled();
         return permission_auto_classifier.Classifier.withProvider(provider, .{
             .credential = self.api_key,
+            .account_id = self.account_id,
             .tenant = self.gateway_team,
             .endpoint = self.gateway_chat_url,
             .cancel_flag = self.cancel_flag,
@@ -370,7 +365,6 @@ pub fn executeToolCallAuthorized(
         execution_ctx.permission_grants = authority.grants;
         execution_ctx.session_grants = authority.grants;
         execution_ctx.permission_rules = authority.rules;
-        execution_ctx.sandbox_backend = authority.sandbox_backend;
         execution_ctx.advertised_dynamic_tool_names = authority.integrations;
         execution_ctx.mcp_access = rebindMcpAuthorityGeneration(
             execution_ctx.mcp_access,
@@ -425,7 +419,6 @@ pub fn executeToolCallAuthorized(
             request.classification_complete,
             request.authorized_image_catalog,
         )) catch |err| {
-        if (request.isSandboxWideningRetryCancellationError(err)) return err;
         diagnostics.recordToolCallResult(.{
             .name = request.call.name,
             .arguments_json = request.call.arguments_json,
@@ -435,23 +428,19 @@ pub fn executeToolCallAuthorized(
         });
         return if (err == error.CancelledBeforeExecution) error.Cancelled else err;
     };
-    if (!request.resultAwaitsSandboxWidening(result)) {
-        const ok = switch (result.status) {
-            .success => true,
-            else => false,
-        };
-        diagnostics.recordToolCallResult(.{
-            .name = request.call.name,
-            .arguments_json = request.call.arguments_json,
-            .model_output = result.model_output,
-            .ok = ok,
-            .started_at_ms = started_at_ms,
-        });
-    }
+    const ok = switch (result.status) {
+        .success => true,
+        else => false,
+    };
+    diagnostics.recordToolCallResult(.{
+        .name = request.call.name,
+        .arguments_json = request.call.arguments_json,
+        .model_output = result.model_output,
+        .ok = ok,
+        .started_at_ms = started_at_ms,
+    });
     if (request.command_replay_capture) |continued| {
-        replay_continuation_transferred = result.command_replay_capture == continued or
-            (result.sandbox_scope_required != null and
-                result.sandbox_scope_required.?.command_replay_capture == continued);
+        replay_continuation_transferred = result.command_replay_capture == continued;
     }
     return result;
 }
@@ -891,8 +880,6 @@ fn typedDispatchContext(ctx: Context, arena: Allocator) tool_dispatch.DispatchCo
         .output_chunk_ctx = ctx.output_chunk_ctx,
         .on_output_chunk = ctx.on_output_chunk,
         .command_timeout_ms = ctx.command_timeout_ms,
-        .sandbox_backend = ctx.sandbox_backend,
-        .devbox_provider = ctx.devbox_provider,
         .ask_question_ctx = if (ctx.interactive) ctx.worker else null,
         .ask_question_batch = if (ctx.interactive) requestQuestionBatchWithWorker else null,
         .web_fetch_runtime = ctx.web_fetch_runtime,
@@ -1100,14 +1087,58 @@ fn visionPathFailure(alloc: Allocator, err: anyerror) Allocator.Error!ToolExecut
     };
 }
 
+fn visionPathImagePreparationFailure(alloc: Allocator) Allocator.Error!ToolExecutionResult {
+    const details = [_]tool_result_errors.Detail{
+        .{ .name = "error", .value = .{ .string = "ImagePreparationFailed" } },
+    };
+    return .{
+        .status = .failure,
+        .status_detail = "ImagePreparationFailed",
+        .model_output = try tool_result_errors.toolExecutionFailureJson(alloc, .{
+            .tool_name = "vision",
+            .message = "Vision could not prepare an approved image path.",
+            .details = &details,
+            .suggestion = image_attachments.image_preparation_failed_notice,
+        }),
+    };
+}
+
 fn visionPathPreparationFailure(
     alloc: Allocator,
     err: anyerror,
 ) !ToolExecutionResult {
     return switch (err) {
-        error.OutOfMemory, error.Cancelled => err,
+        error.OutOfMemory, error.Cancelled, error.TimedOut => err,
+        error.ImagePreparationFailed => visionPathImagePreparationFailure(alloc),
         else => visionPathFailure(alloc, err),
     };
+}
+
+test "Vision path preparation reports semantic failure and preserves operational errors" {
+    const alloc = std.testing.allocator;
+    const failed = try visionPathPreparationFailure(alloc, error.ImagePreparationFailed);
+    defer alloc.free(@constCast(failed.model_output));
+    try std.testing.expectEqualStrings("ImagePreparationFailed", failed.status_detail.?);
+    try expectContains(failed.model_output, "Vision could not prepare an approved image path.");
+    try expectContains(failed.model_output, image_attachments.image_preparation_failed_notice);
+
+    const too_large = try visionPathPreparationFailure(alloc, error.ImageTooLarge);
+    defer alloc.free(@constCast(too_large.model_output));
+    try std.testing.expectEqualStrings("ImageTooLarge", too_large.status_detail.?);
+    try expectContains(too_large.model_output, "under 20 MiB");
+
+    try std.testing.expectError(
+        error.Cancelled,
+        visionPathPreparationFailure(alloc, error.Cancelled),
+    );
+    try std.testing.expectError(
+        error.TimedOut,
+        visionPathPreparationFailure(alloc, error.TimedOut),
+    );
+    try std.testing.expectError(
+        error.OutOfMemory,
+        visionPathPreparationFailure(alloc, error.OutOfMemory),
+    );
 }
 
 fn semanticFailure(output: []const u8) ToolExecutionResult {
@@ -1139,19 +1170,12 @@ fn toolRunCommand(
 ) !ToolExecutionResult {
     const command = request.command;
     const cwd = request.resolved_cwd;
-    const resolved_backend = sandbox.resolveBackend(ctx.sandbox_backend);
-    const authority_scope = commandAuthorityFingerprint(authority).scope;
-    const needs_preflight_widening = authority_scope == .restricted and
-        resolved_backend == .macos and
-        sandbox.needsBroaderFileAccess(command);
     const command_ctx = command_admission.CommandContext{
         .command = command,
         .resolved_cwd = cwd,
         .background = false,
-        .resolved_backend = resolved_backend,
         .target_os = builtin.os.tag,
         .environment = request.environment,
-        .scope = authority_scope,
     };
     const timeout_started_ms = ctx.command_timeout_started_ms orelse
         if (ctx.command_timeout_ms != null) io_mod.milliTimestamp() else null;
@@ -1171,9 +1195,6 @@ fn toolRunCommand(
     if (comptime builtin.os.tag == .wasi) return error.WorkspaceUnavailable;
 
     try execution_router.validateConfigContext(.{
-        .backend = ctx.sandbox_backend,
-        .workspace_root = ctx.workspace_root,
-        .access_scope = ctx.access_scope,
         .max_command_output_bytes = ctx.max_command_output_bytes,
     }, command_ctx);
     var route = try execution_router.prepareAuthorizedRoute(arena, command_ctx, authority);
@@ -1237,15 +1258,6 @@ fn toolRunCommand(
         );
     }
 
-    if (route == .approved_shell and needs_preflight_widening) {
-        return sandboxScopeRequiredPreflight(
-            arena,
-            authority,
-            timeout_started_ms,
-        );
-    }
-    const use_permissive = authority_scope == .broader;
-
     const replay_init = initCommandReplayCapture(
         arena,
         ctx.interactive,
@@ -1269,9 +1281,6 @@ fn toolRunCommand(
     };
 
     const routed = execution_router.executePreparedRoute(.{
-        .backend = ctx.sandbox_backend,
-        .workspace_root = ctx.workspace_root,
-        .access_scope = ctx.access_scope,
         .max_command_output_bytes = ctx.max_command_output_bytes,
         .cancel_flag = runtimeCancelFlag(ctx),
         .output_chunk_lifecycle_id = ctx.output_chunk_lifecycle_id,
@@ -1280,10 +1289,8 @@ fn toolRunCommand(
         .accepted_output_chunk_ctx = if (ctx.interactive) @ptrCast(&replay_callback) else null,
         .on_accepted_output_chunk = if (ctx.interactive) CommandReplayCaptureCallback.onChunk else null,
         .callback_projection = if (ctx.interactive) .raw else .model_safe,
-        .permissive = use_permissive,
         .timeout_ms = ctx.command_timeout_ms,
         .timeout_started_ms = timeout_started_ms,
-        .devbox_provider = ctx.devbox_provider,
         .command_artifact_capability = ctx.session_child_capability,
         .command_artifact_dir = ctx.command_artifact_dir,
     }, arena, route) catch |err| {
@@ -1307,26 +1314,6 @@ fn toolRunCommand(
 
     if (try command_result_mapping.Foreground.cancelledFailure(arena, result)) |cancelled| {
         return cancelled;
-    }
-
-    if (routed.route == .approved_shell and
-        authority_scope == .restricted and
-        resolved_backend == .macos and
-        sandbox.looksLikeSandboxError(result.output))
-    {
-        return finishCommandToolResult(
-            replay_capture,
-            replay_init.unavailable and
-                (ctx.command_replay_unavailable or replay_callback.had_accepted_output),
-            &replay_transferred,
-            result,
-            try sandboxScopeRequiredReactive(
-                arena,
-                authority,
-                timeout_started_ms,
-                result,
-            ),
-        );
     }
 
     if (try command_result_mapping.Foreground.nonZeroFailure(arena, result)) |failure| {
@@ -1425,71 +1412,6 @@ fn executeWorkspaceRunCommand(
     );
 }
 
-fn commandAuthorityFingerprint(
-    authority: command_admission.CommandExecutionAuthority,
-) command_admission.AdmissionFingerprint {
-    return switch (authority) {
-        .direct_only => |fingerprint| fingerprint,
-        .shell_allowed => |allowed| allowed.fingerprint,
-    };
-}
-
-fn dupedAdmittedFingerprint(
-    arena: Allocator,
-    authority: command_admission.CommandExecutionAuthority,
-) !command_admission.AdmissionFingerprint {
-    var admitted = commandAuthorityFingerprint(authority);
-    admitted.command = try arena.dupe(u8, admitted.command);
-    admitted.resolved_cwd = try arena.dupe(u8, admitted.resolved_cwd);
-    admitted.environment = switch (admitted.environment) {
-        .legacy => .legacy,
-        .workspace_clean => .workspace_clean,
-        .clean => |path| .{ .clean = try arena.dupe(u8, path) },
-        .user => |path| .{ .user = try arena.dupe(u8, path) },
-    };
-    return admitted;
-}
-
-fn sandboxScopeRequiredPreflight(
-    arena: Allocator,
-    authority: command_admission.CommandExecutionAuthority,
-    timeout_started_ms: ?i64,
-) !ToolExecutionResult {
-    return .{
-        .status = .failure,
-        .model_output = "",
-        .sandbox_scope_required = .{
-            .phase = .preflight,
-            .restricted_fingerprint = try dupedAdmittedFingerprint(arena, authority),
-            .command_timeout_started_ms = timeout_started_ms,
-        },
-    };
-}
-
-fn sandboxScopeRequiredReactive(
-    arena: Allocator,
-    authority: command_admission.CommandExecutionAuthority,
-    timeout_started_ms: ?i64,
-    result: command_contract.RunCommandResult,
-) !ToolExecutionResult {
-    const command_result_json = if (result.command_result) |command_result|
-        try command_result.toJson(arena)
-    else
-        null;
-    return .{
-        .status = .failure,
-        .model_output = result.output,
-        .command_result_json = command_result_json,
-        .sandbox_scope_required = .{
-            .phase = .reactive,
-            .restricted_fingerprint = try dupedAdmittedFingerprint(arena, authority),
-            .command_timeout_started_ms = timeout_started_ms,
-            .restricted_model_output = result.output,
-            .restricted_command_result_json = command_result_json,
-        },
-    };
-}
-
 const CommandReplayCaptureCallback = struct {
     alloc: Allocator,
     capture: ?*command_replay_store.Capture,
@@ -1571,17 +1493,12 @@ fn finishCommandToolResult(
             owned.tool_result_memory = memory;
         }
     }
-    if (owned.sandbox_scope_required) |*required| {
-        required.command_replay_capture = capture;
-        required.command_replay_unavailable = replay_unavailable;
-    } else {
-        if (replay_unavailable) {
-            var memory = owned.tool_result_memory orelse types.ToolResultMemory{};
-            memory.command_output_replay = .unavailable;
-            owned.tool_result_memory = memory;
-        }
-        owned.command_replay_capture = capture;
+    if (replay_unavailable) {
+        var memory = owned.tool_result_memory orelse types.ToolResultMemory{};
+        memory.command_output_replay = .unavailable;
+        owned.tool_result_memory = memory;
     }
+    owned.command_replay_capture = capture;
     if (capture != null) replay_transferred.* = true;
     return owned;
 }
@@ -2126,7 +2043,6 @@ const TestRuntime = struct {
     workspace_root: []const u8 = "/tmp",
     ignored_list_entries: []const []const u8 = &.{},
     skills_dir: []const u8 = "",
-    sandbox_backend: sandbox.BackendKind = .none,
     tracker: ?*change_tracker.ChangeTracker = null,
     permission_rules: types.PermissionRuleSet = .{},
     permission_grants: []const PermissionGrant = &.{},
@@ -2217,7 +2133,6 @@ const TestRuntime = struct {
             .command_artifact_dir = self.command_artifact_dir,
             .session_child_capability = self.session_child_capability,
             .command_timeout_ms = self.command_timeout_ms,
-            .sandbox_backend = self.sandbox_backend,
             .tracker = self.tracker,
             .mcp_ctx = self.mcp_ctx,
             .mcp_has_tool = self.mcp_has_tool,
@@ -2341,7 +2256,6 @@ const SubagentTestAuthority = struct {
                 },
                 .mode = .full,
             },
-            .none,
             &.{},
             .{},
             &.{},
@@ -3248,31 +3162,6 @@ const TestCommandOutputCapture = struct {
     }
 };
 
-const TestDevboxProvider = struct {
-    calls: usize = 0,
-};
-
-fn executeTestDevboxProvider(
-    raw_ctx: ?*anyopaque,
-    alloc: Allocator,
-    _: []const u8,
-    _: []const u8,
-    control: devbox_executor.Control,
-) devbox_executor.ProviderError!devbox_executor.VercelOutcome {
-    try control.check();
-    const state: *TestDevboxProvider = @ptrCast(@alignCast(raw_ctx.?));
-    state.calls += 1;
-    const stdout = try alloc.dupe(u8, "DEVBOX_COMPACT_ONE\nDEVBOX_COMPACT_TWO\n");
-    errdefer alloc.free(stdout);
-    const stderr = try alloc.dupe(u8, "");
-    return .{ .success = .{
-        .exit_code = 0,
-        .stdout = stdout,
-        .stderr = stderr,
-        .duration_ms = 9,
-    } };
-}
-
 fn runCommandArgsForTest(alloc: Allocator, command: []const u8) ![]u8 {
     var out: std.Io.Writer.Allocating = .init(alloc);
     defer out.deinit();
@@ -3468,7 +3357,6 @@ const TestAutoReview = struct {
             .tool => |tool| {
                 self.exact_arguments_json = tool.arguments_json;
             },
-            .sandbox_widening => {},
         }
         return .{ .valid = .{
             .risk = self.risk,
@@ -4099,7 +3987,6 @@ test "real tool runtime enforces refreshed live authority before filesystem effe
                 .generation = 2,
                 .root_id = "root",
                 .tools = &denied_tools,
-                .sandbox_backend = .none,
                 .integrations = &.{},
                 .rules = .{},
                 .grants = &.{},
@@ -4125,7 +4012,6 @@ test "real tool runtime enforces refreshed live authority before filesystem effe
             .generation = 3,
             .root_id = "root",
             .tools = &allowed_tools,
-            .sandbox_backend = .none,
             .integrations = &.{},
             .rules = .{},
             .grants = &.{},
@@ -6364,165 +6250,6 @@ test "interactive command replay capture allocation fails open" {
     }
 }
 
-test "interactive devbox success emits raw provider output once" {
-    const alloc = std.testing.allocator;
-    var arena_state = std.heap.ArenaAllocator.init(alloc);
-    defer arena_state.deinit();
-    const arena = arena_state.allocator();
-
-    var rt = TestRuntime{
-        .workspace_root = "/tmp",
-        .permission_mode = .auto,
-        .sandbox_backend = .vercel,
-    };
-    defer rt.deinit(alloc);
-    var provider = TestDevboxProvider{};
-    var captured = TestCommandOutputCapture{ .alloc = alloc };
-    defer captured.deinit();
-    var ctx = rt.context();
-    ctx.devbox_provider = .{
-        .ctx = @ptrCast(&provider),
-        .execute_fn = executeTestDevboxProvider,
-    };
-    ctx.output_chunk_ctx = @ptrCast(&captured);
-    ctx.on_output_chunk = TestCommandOutputCapture.onChunk;
-
-    const result = try executeTestRunCommand(ctx, arena, .{
-        .id = "devbox-compact",
-        .name = "terminal",
-        .arguments_json = "{\"action\":\"exec\",\"command\":\"printf remote > provider-output.txt\"}",
-    });
-
-    try std.testing.expectEqual(@as(usize, 1), provider.calls);
-    try std.testing.expectEqualStrings(
-        "DEVBOX_COMPACT_ONE\nDEVBOX_COMPACT_TWO\n",
-        captured.bytes.items,
-    );
-    try std.testing.expectEqual(@as(usize, 1), captured.stdout_chunks);
-    try std.testing.expectEqual(@as(usize, 0), captured.stderr_chunks);
-    try expectContains(result.model_output, "<stdout>\nDEVBOX_COMPACT_ONE\nDEVBOX_COMPACT_TWO\n</stdout>\n");
-    const replay = result.command_replay_capture orelse
-        return error.TestExpectedReplay;
-    try std.testing.expect(replay.hasOutput());
-}
-
-test "run_command reactive sandbox retry timeout retains both attempts" {
-    if (builtin.os.tag != .macos) return;
-
-    const alloc = std.testing.allocator;
-    const zio = io_mod.getIo();
-    const fixture_root = try std.fmt.allocPrint(
-        alloc,
-        "/var/tmp/fx-sandbox-retry-{d}-{d}",
-        .{ std.c.getpid(), io_mod.nanoTimestamp() },
-    );
-    defer alloc.free(fixture_root);
-    try std.Io.Dir.cwd().createDirPath(zio, fixture_root);
-    defer std.Io.Dir.cwd().deleteTree(zio, fixture_root) catch {};
-
-    const home_path = try std.fs.path.join(alloc, &.{ fixture_root, "home" });
-    defer alloc.free(home_path);
-    const cache_path = try std.fs.path.join(alloc, &.{ home_path, ".cache" });
-    defer alloc.free(cache_path);
-    const workspace_path = try std.fs.path.join(alloc, &.{ fixture_root, "workspace" });
-    defer alloc.free(workspace_path);
-
-    // The restricted profile permits /tmp and /private/tmp, so a fixture there
-    // cannot prove that the retry widens access to the user's cache directory.
-    try std.Io.Dir.cwd().createDirPath(zio, cache_path);
-    try std.Io.Dir.cwd().createDirPath(zio, workspace_path);
-    const home = try io_mod.realpathAlloc(alloc, home_path);
-    defer alloc.free(home);
-    const workspace = try io_mod.realpathAlloc(alloc, workspace_path);
-    defer alloc.free(workspace);
-    try setTestHome(home);
-    defer setTestHome(null) catch {};
-    var arena_state = std.heap.ArenaAllocator.init(alloc);
-    defer arena_state.deinit();
-    const arena = arena_state.allocator();
-    const marker = try std.fmt.allocPrint(
-        arena,
-        "{s}/.cache/fx-replay-retry-{d}",
-        .{ home, io_mod.nanoTimestamp() },
-    );
-    defer std.Io.Dir.deleteFileAbsolute(io_mod.getIo(), marker) catch {};
-    const command = try std.fmt.allocPrint(
-        arena,
-        "printf 'FIRST-ATTEMPT\\n'; printf x > '{s}' || exit 1; printf 'RETRY-ATTEMPT\\n'; sleep 5",
-        .{marker},
-    );
-    const args = try runCommandArgsWithCleanProfileForTest(arena, command);
-
-    var rt = TestRuntime{
-        .workspace_root = workspace,
-        .permission_mode = .auto,
-        .sandbox_backend = .macos,
-        .command_timeout_ms = 750,
-    };
-    defer rt.deinit(alloc);
-    const call = ToolCall{
-        .id = "retry-timeout",
-        .name = "terminal",
-        .arguments_json = args,
-    };
-    const restricted = try executeTestRunCommand(rt.context(), arena, call);
-    const required = restricted.sandbox_scope_required orelse
-        return error.TestExpectedSandboxScopeRequired;
-    try std.testing.expectEqual(
-        tool_contracts.SandboxWideningPhase.reactive,
-        required.phase,
-    );
-
-    var broader_context = try tool_admission.runCommandContext(
-        rt.context().admissionInput(),
-        arena,
-        call,
-    );
-    broader_context.scope = .broader;
-    var restricted_capture_owned = required.command_replay_capture != null;
-    defer if (restricted_capture_owned) {
-        required.command_replay_capture.?.abort(arena);
-    };
-    restricted_capture_owned = false;
-    const result = try executeToolCallAuthorized(rt.context(), .{
-        .call_allocator = arena,
-        .result_allocator = arena,
-        .call = call,
-        .authority = .{ .run_command = .{ .shell_allowed = .{
-            .fingerprint = .init(broader_context),
-            .source = .auto_classifier,
-        } } },
-        .session_grants = &.{},
-        .advertised_dynamic_tool_names = &.{},
-        .max_tool_result_bytes = rt.max_tool_result_bytes,
-        .command_timeout_started_ms = required.command_timeout_started_ms,
-        .command_replay_capture = required.command_replay_capture,
-        .command_replay_unavailable = required.command_replay_unavailable,
-    });
-    try std.testing.expectEqual(tool_contracts.ToolExecutionStatus.failure, result.status);
-    try expectContains(result.model_output, "timeout=true\n");
-    try expectNotContains(result.model_output, "FIRST-ATTEMPT");
-    try expectNotContains(result.model_output, "RETRY-ATTEMPT");
-
-    const capture = result.command_replay_capture orelse
-        return error.TestExpectedReplay;
-    defer capture.abort(arena);
-    var canonical = (try capture.canonicalizeForComparison(
-        arena,
-    )) orelse return error.TestExpectedReplay;
-    defer canonical.deinit(arena);
-    var first_attempts: usize = 0;
-    var retry_attempts: usize = 0;
-    for (canonical.records.items) |record| {
-        if (record.stream == .stdout and
-            std.mem.eql(u8, record.text.items, "FIRST-ATTEMPT")) first_attempts += 1;
-        if (record.stream == .stdout and
-            std.mem.eql(u8, record.text.items, "RETRY-ATTEMPT")) retry_attempts += 1;
-    }
-    try std.testing.expectEqual(@as(usize, 2), first_attempts);
-    try std.testing.expectEqual(@as(usize, 1), retry_attempts);
-}
-
 test "run_command post-spawn cancellation returns structured evidence in every mode" {
     if (builtin.os.tag == .windows or builtin.os.tag == .wasi) return;
 
@@ -6541,7 +6268,6 @@ test "run_command post-spawn cancellation returns structured evidence in every m
         .workspace_root = workspace,
         .cancel_flag = &cancel,
         .permission_mode = .auto,
-        .sandbox_backend = .none,
         .command_artifact_dir = artifact_dir,
     };
     defer rt.deinit(alloc);
@@ -6618,7 +6344,7 @@ test "run_command post-spawn cancellation returns structured evidence in every m
     var retry_ctx = rt.context();
     retry_ctx.output_chunk_ctx = @ptrCast(&headless_trigger);
     retry_ctx.on_output_chunk = CancelTestCommandOnOutput.onChunk;
-    var command_ctx = try tool_admission.runCommandContext(
+    const command_ctx = try tool_admission.runCommandContext(
         retry_ctx.admissionInput(),
         arena,
         .{
@@ -6627,7 +6353,6 @@ test "run_command post-spawn cancellation returns structured evidence in every m
             .arguments_json = headless_args,
         },
     );
-    command_ctx.scope = .broader;
     const retry = try executeToolCallAuthorized(retry_ctx, .{
         .call_allocator = arena,
         .result_allocator = arena,
@@ -6647,108 +6372,6 @@ test "run_command post-spawn cancellation returns structured evidence in every m
     try std.testing.expect(headless_trigger.seen);
     try std.testing.expect(retry.cancelled);
     var metrics: [1]diagnostics.ToolCallMetric = undefined;
-    try std.testing.expectEqual(@as(usize, 0), diagnostics.snapshotToolCalls(&metrics));
-}
-
-test "broader sandbox retry consumes the original command timeout budget" {
-    if (builtin.os.tag == .windows or builtin.os.tag == .wasi) return;
-
-    var rt = TestRuntime{
-        .command_timeout_ms = 1,
-        .sandbox_backend = .none,
-    };
-    defer rt.deinit(std.testing.allocator);
-
-    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer arena_state.deinit();
-    const arena = arena_state.allocator();
-    const call = ToolCall{
-        .id = "broader-timeout",
-        .name = "terminal",
-        .arguments_json = "{\"action\":\"exec\",\"command\":\"sleep 5\"}",
-    };
-    var command_ctx = try tool_admission.runCommandContext(
-        rt.context().admissionInput(),
-        arena,
-        call,
-    );
-    command_ctx.scope = .broader;
-    const original_start_ms = io_mod.milliTimestamp() - 50;
-
-    const result = try executeToolCallAuthorized(rt.context(), .{
-        .call_allocator = arena,
-        .result_allocator = arena,
-        .call = call,
-        .authority = .{ .run_command = .{ .shell_allowed = .{
-            .fingerprint = .init(command_ctx),
-            .source = .auto_classifier,
-        } } },
-        .session_grants = &.{},
-        .advertised_dynamic_tool_names = &.{},
-        .max_tool_result_bytes = rt.max_tool_result_bytes,
-        .command_timeout_started_ms = original_start_ms,
-    });
-
-    try std.testing.expectEqual(tool_contracts.ToolExecutionStatus.failure, result.status);
-    try expectContains(result.model_output, "timeout=true\n");
-    try expectContains(result.model_output, "timeout_ms=1\n");
-}
-
-test "pre-spawn broader retry cancellation defers tool diagnostics" {
-    if (builtin.os.tag == .windows or builtin.os.tag == .wasi) return;
-
-    diagnostics.resetForTest();
-    defer diagnostics.resetForTest();
-    var cancel = std.atomic.Value(bool).init(true);
-    var rt = TestRuntime{
-        .cancel_flag = &cancel,
-        .permission_mode = .auto,
-        .sandbox_backend = .none,
-    };
-    defer rt.deinit(std.testing.allocator);
-    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer arena_state.deinit();
-    const arena = arena_state.allocator();
-    const call = ToolCall{
-        .id = "cancel-before-broader-retry",
-        .name = "terminal",
-        .arguments_json = "{\"action\":\"exec\",\"command\":\"printf never > cancelled-before-retry\"}",
-    };
-    var command_ctx = try tool_admission.runCommandContext(
-        rt.context().admissionInput(),
-        arena,
-        call,
-    );
-    command_ctx.scope = .broader;
-    var request: tool_contracts.ToolExecutionRequest = .{
-        .call_allocator = arena,
-        .result_allocator = arena,
-        .call = call,
-        .authority = .{ .run_command = .{ .shell_allowed = .{
-            .fingerprint = .init(command_ctx),
-            .source = .auto_classifier,
-        } } },
-        .session_grants = &.{},
-        .advertised_dynamic_tool_names = &.{},
-        .max_tool_result_bytes = rt.max_tool_result_bytes,
-    };
-
-    try std.testing.expectError(
-        error.CancelledBeforeExecution,
-        executeToolCallAuthorized(rt.context(), request),
-    );
-    var metrics: [1]diagnostics.ToolCallMetric = undefined;
-    try std.testing.expectEqual(@as(usize, 0), diagnostics.snapshotToolCalls(&metrics));
-
-    command_ctx.scope = .restricted;
-    request.authority = .{ .run_command = .{ .shell_allowed = .{
-        .fingerprint = .init(command_ctx),
-        .source = .auto_classifier,
-    } } };
-    try std.testing.expectError(
-        error.Cancelled,
-        executeToolCallAuthorized(rt.context(), request),
-    );
     try std.testing.expectEqual(@as(usize, 1), diagnostics.snapshotToolCalls(&metrics));
 }
 
@@ -6757,7 +6380,6 @@ test "run_command success exposes structured foreground metadata" {
 
     var rt = TestRuntime{
         .permission_mode = .auto,
-        .sandbox_backend = .none,
     };
     defer rt.deinit(std.testing.allocator);
 
@@ -6935,7 +6557,6 @@ test "run_command propagates output callback failure" {
 
     var rt = TestRuntime{
         .permission_mode = .auto,
-        .sandbox_backend = .none,
     };
     defer rt.deinit(std.testing.allocator);
 
@@ -6960,7 +6581,6 @@ test "run_command returns model output and structured metadata" {
 
     var rt = TestRuntime{
         .permission_mode = .auto,
-        .sandbox_backend = .none,
     };
     defer rt.deinit(std.testing.allocator);
 
@@ -6992,7 +6612,6 @@ test "run_command nonzero exit returns structured masked failure" {
 
     var rt = TestRuntime{
         .permission_mode = .auto,
-        .sandbox_backend = .none,
     };
     defer rt.deinit(std.testing.allocator);
 
@@ -7043,7 +6662,6 @@ test "run_command huge output exposes truncation and artifact paths without stdo
     var rt = TestRuntime{
         .workspace_root = workspace,
         .permission_mode = .auto,
-        .sandbox_backend = .none,
     };
     rt.max_command_output_bytes = 16;
     rt.command_artifact_dir = artifact_dir;
@@ -7067,90 +6685,6 @@ test "run_command huge output exposes truncation and artifact paths without stdo
     try expectCommandResultStringPrefix(structured, "stdout_file", artifact_dir);
     try expectCommandResultStringPrefix(structured, "stderr_file", artifact_dir);
     try std.testing.expect(std.mem.find(u8, structured, "00000000000000000000000000") == null);
-}
-
-test "run_command reactive sandbox widening preserves the restricted attempt" {
-    if (builtin.os.tag != .macos) return;
-
-    var rt = TestRuntime{
-        .permission_mode = .auto,
-        .sandbox_backend = .macos,
-        .interactive = false,
-    };
-    defer rt.deinit(std.testing.allocator);
-
-    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer arena_state.deinit();
-
-    const result = try executeTestRunCommand(rt.context(), arena_state.allocator(), .{
-        .id = "cmd",
-        .name = "terminal",
-        .arguments_json = "{\"action\":\"exec\",\"command\":\"printf 'Operation not permitted\\\\n' >&2; exit 1\",\"profile\":\"clean\"}",
-    });
-
-    try std.testing.expectEqual(tool_contracts.ToolExecutionStatus.failure, result.status);
-    try expectContains(result.model_output, "Operation not permitted");
-    const widening = result.sandbox_scope_required orelse
-        return error.TestExpectedSandboxScopeRequired;
-    try std.testing.expectEqual(tool_contracts.SandboxWideningPhase.reactive, widening.phase);
-    try std.testing.expectEqualStrings(
-        "printf 'Operation not permitted\\n' >&2; exit 1",
-        widening.restricted_fingerprint.command,
-    );
-    try std.testing.expectEqualStrings("/tmp", widening.restricted_fingerprint.resolved_cwd);
-    try std.testing.expectEqualStrings(
-        result.model_output,
-        widening.restricted_model_output orelse return error.TestExpectedRestrictedResult,
-    );
-    const structured = result.command_result_json orelse return error.TestExpectedEqual;
-    try std.testing.expectEqualStrings(
-        structured,
-        widening.restricted_command_result_json orelse
-            return error.TestExpectedRestrictedResult,
-    );
-    try expectCommandResultField(structured, "kind", "foreground");
-    try expectCommandResultField(structured, "command", "printf 'Operation not permitted\\n' >&2; exit 1");
-    try expectCommandResultInt(structured, "exit_code", 1);
-    try expectCommandResultInt(structured, "stdout_bytes", 0);
-    try expectCommandResultInt(structured, "stderr_bytes", 24);
-    try std.testing.expect(rt.worker.pending_permission_request_shared == null);
-}
-
-test "run_command preflight sandbox widening reports that no attempt ran" {
-    if (builtin.os.tag != .macos) return;
-
-    diagnostics.resetForTest();
-    defer diagnostics.resetForTest();
-
-    var rt = TestRuntime{
-        .permission_mode = .auto,
-        .sandbox_backend = .macos,
-        .interactive = false,
-    };
-    defer rt.deinit(std.testing.allocator);
-
-    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer arena_state.deinit();
-
-    const result = try executeTestRunCommand(rt.context(), arena_state.allocator(), .{
-        .id = "cmd",
-        .name = "terminal",
-        .arguments_json = "{\"action\":\"exec\",\"command\":\"npm test\"}",
-    });
-
-    try std.testing.expectEqual(tool_contracts.ToolExecutionStatus.failure, result.status);
-    try std.testing.expectEqualStrings("", result.model_output);
-    try std.testing.expect(result.command_result_json == null);
-    const widening = result.sandbox_scope_required orelse
-        return error.TestExpectedSandboxScopeRequired;
-    try std.testing.expectEqual(tool_contracts.SandboxWideningPhase.preflight, widening.phase);
-    try std.testing.expectEqualStrings("npm test", widening.restricted_fingerprint.command);
-    try std.testing.expectEqualStrings("/tmp", widening.restricted_fingerprint.resolved_cwd);
-    try std.testing.expect(widening.restricted_model_output == null);
-    try std.testing.expect(widening.restricted_command_result_json == null);
-    try std.testing.expect(rt.worker.pending_permission_request_shared == null);
-    var metrics: [1]diagnostics.ToolCallMetric = undefined;
-    try std.testing.expectEqual(@as(usize, 0), diagnostics.snapshotToolCalls(&metrics));
 }
 
 test "terminal exec rejects legacy background input without creating state" {
@@ -7659,7 +7193,6 @@ test "MCP execution binds the last live action generation before transport" {
             .generation = 41,
             .root_id = "root",
             .tools = &.{},
-            .sandbox_backend = .none,
             .integrations = &integrations,
             .rules = .{},
             .grants = &.{},

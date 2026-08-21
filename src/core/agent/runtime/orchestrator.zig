@@ -1117,125 +1117,6 @@ fn finishPendingCancelledCalls(
     }
 }
 
-fn reactiveSandboxWideningFailure(
-    arena: Allocator,
-    required: runtime_tool_contracts.SandboxScopeRequired,
-    reason: []const u8,
-) !ToolExecutionResult {
-    const restricted_output = required.restricted_model_output orelse "";
-    var details: [6]tool_result_errors.Detail = undefined;
-    var detail_count: usize = 0;
-    details[detail_count] = .{ .name = "phase", .value = .{ .string = "reactive" } };
-    detail_count += 1;
-    details[detail_count] = .{ .name = "restricted_attempt_ran", .value = .{ .boolean = true } };
-    detail_count += 1;
-    details[detail_count] = .{ .name = "broader_retry_ran", .value = .{ .boolean = false } };
-    detail_count += 1;
-    details[detail_count] = .{ .name = "reason", .value = .{ .string = reason } };
-    detail_count += 1;
-    details[detail_count] = .{ .name = "restricted_result", .value = .{ .string = restricted_output } };
-    detail_count += 1;
-    if (required.restricted_command_result_json) |command_result_json| {
-        details[detail_count] = .{
-            .name = "restricted_command_result",
-            .value = .{ .string = command_result_json },
-        };
-        detail_count += 1;
-    }
-    return .{
-        .status = .failure,
-        .status_detail = "restricted attempt ran; broader retry did not run",
-        .model_output = try tool_result_errors.toolExecutionFailureJson(arena, .{
-            .tool_name = "terminal",
-            .message = "The restricted sandbox attempt ran and may have partial effects; the broader retry did not run.",
-            .details = details[0..detail_count],
-            .suggestion = "Inspect the retained restricted result and effects. Do not claim that the command never ran or retry unchanged.",
-        }),
-        .command_result_json = required.restricted_command_result_json,
-    };
-}
-
-fn reactiveSandboxWideningRetryCancelled(
-    arena: Allocator,
-    required: runtime_tool_contracts.SandboxScopeRequired,
-    retry_execution: ToolExecutionResult,
-) !ToolExecutionResult {
-    const restricted_output = required.restricted_model_output orelse "";
-    var details: [8]tool_result_errors.Detail = undefined;
-    var detail_count: usize = 0;
-    details[detail_count] = .{ .name = "phase", .value = .{ .string = "reactive" } };
-    detail_count += 1;
-    details[detail_count] = .{ .name = "restricted_attempt_ran", .value = .{ .boolean = true } };
-    detail_count += 1;
-    details[detail_count] = .{ .name = "broader_retry_ran", .value = .{ .boolean = true } };
-    detail_count += 1;
-    details[detail_count] = .{ .name = "reason", .value = .{ .string = "cancelled" } };
-    detail_count += 1;
-    details[detail_count] = .{ .name = "restricted_result", .value = .{ .string = restricted_output } };
-    detail_count += 1;
-    details[detail_count] = .{ .name = "broader_result", .value = .{ .string = retry_execution.model_output } };
-    detail_count += 1;
-    if (required.restricted_command_result_json) |command_result_json| {
-        details[detail_count] = .{
-            .name = "restricted_command_result",
-            .value = .{ .string = command_result_json },
-        };
-        detail_count += 1;
-    }
-    if (retry_execution.command_result_json) |command_result_json| {
-        details[detail_count] = .{
-            .name = "broader_command_result",
-            .value = .{ .string = command_result_json },
-        };
-        detail_count += 1;
-    }
-    return .{
-        .status = .failure,
-        .cancelled = true,
-        .status_detail = "restricted attempt ran; broader retry was cancelled",
-        .model_output = try tool_result_errors.toolExecutionFailureJson(arena, .{
-            .tool_name = "terminal",
-            .message = "The restricted sandbox attempt completed, and the broader retry started before cancellation; either attempt may have partial effects.",
-            .details = details[0..detail_count],
-            .suggestion = "Inspect both retained results and effects before deciding whether another command is safe.",
-        }),
-        .command_result_json = retry_execution.command_result_json orelse
-            required.restricted_command_result_json,
-    };
-}
-
-fn sandboxWideningDeniedResult(
-    arena: Allocator,
-    call: ToolCall,
-    required: runtime_tool_contracts.SandboxScopeRequired,
-    reason: types.ToolPermissionDenialReason,
-) !ToolExecutionResult {
-    return switch (required.phase) {
-        .preflight => .{
-            .status = .failure,
-            .model_output = try tool_result_errors.toolPermissionDeniedJson(
-                arena,
-                call.name,
-                reason,
-            ),
-        },
-        .reactive => reactiveSandboxWideningFailure(
-            arena,
-            required,
-            @tagName(reason),
-        ),
-    };
-}
-
-noinline fn applySandboxReplayUnavailable(
-    required: runtime_tool_contracts.SandboxScopeRequired,
-    memory: *types.ToolResultMemory,
-) void {
-    if (required.command_replay_unavailable) {
-        memory.command_output_replay = .unavailable;
-    }
-}
-
 pub const CommonStopState = struct {
     retained_candidate: ?[]const u8 = null,
     latest_partial: ?[]const u8 = null,
@@ -1688,7 +1569,7 @@ fn refreshGatewayCredentialForJob(
     const previous_api_key = active_api_key.*;
     if (comptime !host_target.is_wasm) {
         if (deps.usage) |usage| {
-            if (source == .chatgpt_subscription) {
+            if (source == .chatgpt_subscription or source == .grok_subscription) {
                 usage.clearReconciliationCredential();
             } else {
                 usage.refreshReconciliationCredential(
@@ -2055,7 +1936,7 @@ fn processQueuedPromptInner(
     }
 
     // The overlay arena is reset for every model step so refreshed env,
-    // sandbox, and background snapshots do not accumulate for the whole turn.
+    // background snapshots do not accumulate for the whole turn.
     var overlay_arena_state = std.heap.ArenaAllocator.init(std.heap.c_allocator);
     defer overlay_arena_state.deinit();
 
@@ -3164,7 +3045,7 @@ fn processQueuedPromptLoop(
                     );
                 }
                 if (!model_provider.usesGatewayAuxiliaries(job.provider)) {
-                    return error.CodexNativeImageUnavailable;
+                    return error.SubscriptionNativeImageUnavailable;
                 }
                 if (job.authorized_image_catalog.len == 0) {
                     return error.MissingAuthorizedImageCatalog;
@@ -3189,7 +3070,7 @@ fn processQueuedPromptLoop(
             else
                 .auto;
             var verified_images: std.ArrayList(image_attachments.VerifiedSnapshot) = .empty;
-            if (job.provider == .codex and job.images.len > 0 and
+            if (job.provider != .gateway and job.images.len > 0 and
                 request_capabilities.supports_vision and request_capabilities.supports_file_input)
             {
                 try verified_images.ensureTotalCapacity(overlay_arena, job.images.len);
@@ -3253,7 +3134,7 @@ fn processQueuedPromptLoop(
                 request_messages.len,
                 config.gateway_tools_json,
             );
-            if (job.provider != .codex) {
+            if (job.provider == .gateway) {
                 try persistRecoveryCheckpoint(
                     deps,
                     arena,
@@ -3285,6 +3166,7 @@ fn processQueuedPromptLoop(
                 arena,
                 active_api_key,
                 job.credential_source,
+                job.account_id,
                 job.gateway_team,
                 lifecycle.scope.session_id,
                 gateway_model,
@@ -3629,7 +3511,7 @@ fn processQueuedPromptLoop(
                 gateway_delivery.load(),
             );
             stream_result_set = true;
-            if (job.provider == .codex and
+            if (job.provider != .gateway and
                 stream_result.status == .unauthorized and
                 !auth_retry_used and
                 stream_ctx.raw_text.items.len == 0 and
@@ -3653,6 +3535,7 @@ fn processQueuedPromptLoop(
                         arena,
                         active_api_key,
                         job.credential_source,
+                        job.account_id,
                         job.gateway_team,
                         lifecycle.scope.session_id,
                         gateway_model,
@@ -3684,7 +3567,7 @@ fn processQueuedPromptLoop(
                     );
                     debug_trace.eventf(
                         "auth",
-                        "codex_request_replayed",
+                        "subscription_request_replayed",
                         step_ctx,
                         "payload_bytes={d} semantic_attempt={d}",
                         .{ request_payload.len, semantic_attempt + 1 },
@@ -3768,7 +3651,7 @@ fn processQueuedPromptLoop(
                 );
             }
             const settled_attempts = semantic_attempt + 1;
-            if (job.provider != .codex or stream_result.status != .unauthorized) {
+            if (job.provider == .gateway or stream_result.status != .unauthorized) {
                 try persistRecoveryCheckpoint(
                     deps,
                     arena,
@@ -3799,7 +3682,7 @@ fn processQueuedPromptLoop(
                 debug_trace.logf("agent", "token progress publication failed source=gateway_usage err={s}", .{@errorName(progress_err)});
             };
             if (stream_result.status == .unauthorized and
-                job.provider != .codex and
+                job.provider == .gateway and
                 !auth_retry_used and
                 semantic_attempt + 1 < semantic_limit)
             {
@@ -6796,9 +6679,6 @@ fn processQueuedPromptLoop(
             }
             const execution_lifecycle_id = types.ToolLifecycleId{ .turn_id = turn_id, .call_id = execution_call.id };
             const execution_is_command = runtime_tool_presentation.activityKindForCall(arena, deps.tool_registry, tool_call) == .command;
-            var sandbox_widening_feedback: ?[]const u8 = null;
-            var sandbox_widening_required: ?runtime_tool_contracts.SandboxScopeRequired = null;
-            var sandbox_widening_retry_started = false;
             var execution = (try executeActionBoundPermissionRequest(
                 deps,
                 arena,
@@ -6845,550 +6725,7 @@ fn processQueuedPromptLoop(
                 break :blk ToolExecutionResult{ .status = .failure, .model_output = try deps.format_tool_execution_error(deps.ctx, arena, tool_call.name, err) };
             };
 
-            if (!(execution.cancelled and config.cancel_flag.load(.seq_cst))) {
-                if (execution.sandbox_scope_required) |required| {
-                    var restricted_replay_owned = required.command_replay_capture != null;
-                    defer if (restricted_replay_owned) {
-                        required.command_replay_capture.?.abort(arena);
-                    };
-                    const widening_authority_generation = if (live_authority) |resolved|
-                        resolved.authority.generation
-                    else
-                        0;
-                    var widening_outcome = runtime_tool_admission.requestSandboxWideningTraced(
-                        deps,
-                        arena,
-                        tool_call,
-                        review_context,
-                        action_permission_mode,
-                        if (live_authority) |resolved|
-                            resolved.authority.grants
-                        else
-                            action_grants,
-                        if (live_authority) |resolved| resolved.authority else null,
-                        advertised_dynamic_tool_names,
-                        required,
-                        config.cancel_flag,
-                        step_ctx,
-                    ) catch |err| {
-                        if (err != error.Cancelled or !config.cancel_flag.load(.seq_cst)) return err;
-                        runtime_telemetry.traceCancelObserved(step_ctx, true);
-                        _ = try stream_ctx.provisional_statuses.finishDeniedCall(
-                            deps,
-                            stream_ctx.alloc,
-                            call_allocator,
-                            turn_id,
-                            execution_call,
-                            status_started,
-                            tool_display_target,
-                            "Cancelled",
-                            advertised_dynamic_tool_names,
-                        );
-                        try finishPendingCancelledCalls(
-                            deps,
-                            &stream_ctx.provisional_statuses,
-                            stream_ctx.alloc,
-                            arena,
-                            config,
-                            turn_id,
-                            effective_tool_calls[tool_call_index + 1 ..],
-                            advertised_dynamic_tool_names,
-                        );
-                        if (execution_is_command) {
-                            try deps.push_command_output_complete(deps.ctx, execution_lifecycle_id);
-                        }
-                        var cancellation_output: []const u8 = "command cancelled\n";
-                        if (required.phase == .reactive) {
-                            const retained = try reactiveSandboxWideningFailure(
-                                arena,
-                                required,
-                                "cancelled",
-                            );
-                            var prepared_retained = try runtime_execution_memory.prepareToolModelOutput(
-                                arena,
-                                config,
-                                tool_call,
-                                retained.model_output,
-                            );
-                            applySandboxReplayUnavailable(required, &prepared_retained.memory);
-                            cancellation_output = prepared_retained.model_output;
-                            try runtime_tool_batch.appendToolResultContent(
-                                arena,
-                                &within_turn_suffix,
-                                &completed_tool_names,
-                                &step_batch,
-                                tool_call,
-                                prepared_retained.model_output,
-                                prepared_retained.memory,
-                                .{
-                                    .increment_error = true,
-                                    .status = .failure,
-                                },
-                            );
-                        }
-                        try runtime_tool_admission.recordRejectedToolCall(
-                            deps,
-                            arena,
-                            tool_call,
-                            cancellation_output,
-                            if (required.phase == .reactive)
-                                required.restricted_command_result_json
-                            else
-                                null,
-                        );
-                        try runtime_tool_batch.drainPendingUserSuffix(arena, &step_batch, &within_turn_suffix);
-                        try runtime_interruption.persistInterruptedTurnOnce(
-                            deps,
-                            finalization,
-                            job,
-                            partial_assistant,
-                            if (required.phase == .reactive) null else tool_call,
-                            completed_tool_names.items,
-                            &interrupted_persisted,
-                            step_ctx,
-                            within_turn_suffix.items,
-                            stop_state.retained_candidate,
-                            &stop_state.terminal_materializing,
-                        );
-                        finish_trace.finish("interrupted");
-                        return;
-                    };
-                    if (widening_outcome.tool_failure) |failure_output| {
-                        const failure = switch (required.phase) {
-                            .preflight => ToolExecutionResult{
-                                .status = .failure,
-                                .model_output = failure_output,
-                                .status_detail = "sandbox widening preflight failed",
-                            },
-                            .reactive => try reactiveSandboxWideningFailure(
-                                arena,
-                                required,
-                                failure_output,
-                            ),
-                        };
-                        var replay_handed_off = required.command_replay_capture == null;
-                        defer if (!replay_handed_off) {
-                            required.command_replay_capture.?.discard(arena);
-                        };
-                        var prepared_failure = try runtime_execution_memory.prepareToolModelOutput(
-                            arena,
-                            config,
-                            tool_call,
-                            failure.model_output,
-                        );
-                        applySandboxReplayUnavailable(required, &prepared_failure.memory);
-                        runtime_execution_memory.finalizeCommandReplay(
-                            arena,
-                            tool_call,
-                            &prepared_failure,
-                            config.session_child_capability,
-                            required.command_replay_capture,
-                        );
-                        restricted_replay_owned = false;
-                        try runtime_tool_presentation.finishExecutedToolStatus(
-                            deps,
-                            call_allocator,
-                            turn_id,
-                            execution_call,
-                            status_started,
-                            tool_display_target,
-                            failure,
-                            prepared_failure.model_output,
-                            prepared_failure.memory,
-                            null,
-                            advertised_dynamic_tool_names,
-                        );
-                        if (status_started) replay_handed_off = true;
-                        if (execution_is_command) {
-                            try deps.push_command_output_complete(
-                                deps.ctx,
-                                execution_lifecycle_id,
-                            );
-                        }
-                        try runtime_tool_batch.appendToolResultContent(
-                            arena,
-                            &within_turn_suffix,
-                            &completed_tool_names,
-                            &step_batch,
-                            tool_call,
-                            prepared_failure.model_output,
-                            prepared_failure.memory,
-                            .{
-                                .increment_total = required.phase == .reactive,
-                                .increment_error = true,
-                                .status = .failure,
-                            },
-                        );
-                        replay_handed_off = true;
-                        try runtime_tool_admission.recordRejectedToolCall(
-                            deps,
-                            arena,
-                            tool_call,
-                            prepared_failure.model_output,
-                            failure.command_result_json,
-                        );
-                        debug_trace.eventf(
-                            "tool",
-                            "execution_result",
-                            step_ctx,
-                            "call_id={s} name={s} result_kind=sandbox_widening_failure phase={s} model_output_bytes={d}",
-                            .{
-                                tool_call.id,
-                                tool_call.name,
-                                @tagName(required.phase),
-                                prepared_failure.model_output.len,
-                            },
-                        );
-                        continue;
-                    }
-                    var validated_widening_generation = widening_authority_generation;
-                    var exact_widening_approval = widening_outcome.human_approval;
-                    while (widening_outcome.tool_failure == null and
-                        !widening_outcome.decision.isDenied() and
-                        deps.live_tool_authority != null)
-                    {
-                        const refreshed = try resolveLiveToolAuthority(
-                            deps,
-                            arena,
-                            tool_call,
-                            config.workspace_root,
-                            advertised_dynamic_tool_names,
-                            live_authority_target,
-                        );
-                        live_authority = refreshed;
-                        if (refreshed.authority.generation == validated_widening_generation) {
-                            if (liveAuthorityUnavailable(refreshed)) {
-                                debug_trace.eventf(
-                                    "subagent",
-                                    "live_authority_rejected",
-                                    step_ctx,
-                                    "call_id={s} tool_name={s} generation={d} outcome=unavailable",
-                                    .{ tool_call.id, tool_call.name, refreshed.authority.generation },
-                                );
-                                if (deps.tool_activity_recorder) |recorder| {
-                                    recorder.record(tool_call.id, tool_call.name, .denied) catch |err| {
-                                        debug_trace.eventf(
-                                            "subagent",
-                                            "tool_activity_projection_lag",
-                                            step_ctx,
-                                            "call_id={s} tool_name={s} phase=denied outcome={s}",
-                                            .{ tool_call.id, tool_call.name, @errorName(err) },
-                                        );
-                                    };
-                                }
-                                rejectPermissionForLiveAuthority(&widening_outcome);
-                            }
-                            break;
-                        }
-
-                        validated_widening_generation = refreshed.authority.generation;
-                        const prepared_authority = widening_outcome.execution_authority orelse
-                            return error.MissingToolExecutionAuthority;
-                        widening_outcome = try runtime_tool_admission.requestToolPermissionTraced(
-                            deps,
-                            arena,
-                            tool_call,
-                            review_context,
-                            refreshed.authority.permission_mode,
-                            refreshed.authority.grants,
-                            refreshed.authority,
-                            .{ .sandbox_widening = .{
-                                .authority = prepared_authority,
-                                .required = required,
-                                .human_approval = exact_widening_approval,
-                            } },
-                            advertised_dynamic_tool_names,
-                            config.workspace_root,
-                            step_ctx,
-                        );
-                        if (exact_widening_approval != .once) {
-                            exact_widening_approval = widening_outcome.human_approval;
-                        }
-                    }
-                    if (widening_outcome.decision.isDenied()) {
-                        const reason = widening_outcome.denial_reason orelse
-                            widening_outcome.decision.denialReason() orelse
-                            .user_denied;
-                        const denied_execution = try sandboxWideningDeniedResult(
-                            arena,
-                            tool_call,
-                            required,
-                            reason,
-                        );
-                        var replay_handed_off = required.command_replay_capture == null;
-                        defer if (!replay_handed_off) {
-                            required.command_replay_capture.?.discard(arena);
-                        };
-                        var prepared_denial = try runtime_execution_memory.prepareToolModelOutput(
-                            arena,
-                            config,
-                            tool_call,
-                            denied_execution.model_output,
-                        );
-                        applySandboxReplayUnavailable(required, &prepared_denial.memory);
-                        runtime_execution_memory.finalizeCommandReplay(
-                            arena,
-                            tool_call,
-                            &prepared_denial,
-                            config.session_child_capability,
-                            required.command_replay_capture,
-                        );
-                        restricted_replay_owned = false;
-                        if (required.phase == .reactive) {
-                            try runtime_tool_presentation.finishDeniedToolStatusWithResultMemory(
-                                deps,
-                                call_allocator,
-                                turn_id,
-                                execution_call,
-                                status_started,
-                                tool_display_target,
-                                runtime_tool_admission.permissionDeniedStatusLabel(reason),
-                                advertised_dynamic_tool_names,
-                                denied_execution,
-                                prepared_denial.model_output,
-                                prepared_denial.memory,
-                            );
-                        } else {
-                            try runtime_tool_presentation.finishDeniedToolStatus(
-                                deps,
-                                call_allocator,
-                                turn_id,
-                                execution_call,
-                                status_started,
-                                tool_display_target,
-                                runtime_tool_admission.permissionDeniedStatusLabel(reason),
-                                advertised_dynamic_tool_names,
-                            );
-                        }
-                        if (status_started) replay_handed_off = true;
-                        if (execution_is_command) {
-                            try deps.push_command_output_complete(deps.ctx, execution_lifecycle_id);
-                        }
-                        try runtime_tool_batch.appendToolResultContent(
-                            arena,
-                            &within_turn_suffix,
-                            &completed_tool_names,
-                            &step_batch,
-                            tool_call,
-                            prepared_denial.model_output,
-                            prepared_denial.memory,
-                            .{
-                                .increment_total = required.phase == .reactive,
-                                .increment_error = required.phase == .reactive,
-                                .status = .failure,
-                            },
-                        );
-                        replay_handed_off = true;
-                        try runtime_tool_admission.recordRejectedToolCall(
-                            deps,
-                            arena,
-                            tool_call,
-                            prepared_denial.model_output,
-                            denied_execution.command_result_json,
-                        );
-                        if (widening_outcome.feedback) |feedback| {
-                            try appendPermissionFeedbackAfterToolResult(
-                                deps,
-                                arena,
-                                &step_batch,
-                                tool_call.id,
-                                &.{feedback},
-                            );
-                        }
-                        continue;
-                    }
-
-                    const broader_authority = widening_outcome.execution_authority orelse
-                        return error.MissingToolExecutionAuthority;
-                    if (broader_authority != .run_command) {
-                        return error.InvalidRunCommandExecutionAuthority;
-                    }
-                    switch (broader_authority.run_command) {
-                        .direct_only => return error.InvalidRunCommandExecutionAuthority,
-                        .shell_allowed => |allowed| if (allowed.fingerprint.scope != .broader) {
-                            return error.InvalidRunCommandExecutionAuthority;
-                        },
-                    }
-                    if (widening_outcome.decision == .always and live_authority == null) {
-                        const sandbox_identity = try command_environment.permissionCommandIdentity(
-                            arena,
-                            required.restricted_fingerprint.environment,
-                            required.restricted_fingerprint.command,
-                        );
-                        try runtime_tool_admission.retainSessionGrant(
-                            deps,
-                            arena,
-                            &local_grants,
-                            "sandbox",
-                            sandbox_identity,
-                        );
-                    }
-                    sandbox_widening_feedback = widening_outcome.feedback;
-                    debug_trace.eventf(
-                        "tool",
-                        "sandbox_widening_retry_start",
-                        step_ctx,
-                        "call_id={s} name={s} phase={s}",
-                        .{ tool_call.id, tool_call.name, @tagName(required.phase) },
-                    );
-                    sandbox_widening_required = required;
-                    execution = if (config.cancel_flag.load(.seq_cst))
-                        ToolExecutionResult{
-                            .status = .failure,
-                            .cancelled = true,
-                            .model_output = "command cancelled\n",
-                        }
-                    else blk: {
-                        sandbox_widening_retry_started = true;
-                        restricted_replay_owned = false;
-                        break :blk deps.execute_tool_call(deps.ctx, .{
-                            .call_allocator = call_allocator,
-                            .result_allocator = arena,
-                            .call = execution_call,
-                            .authority = broader_authority,
-                            .root_user_intent_context = tool_execution_root_user_context,
-                            .root_user_messages = &.{},
-                            .root_user_evidence_complete = true,
-                            .authorized_image_catalog = job.authorized_image_catalog,
-                            .current_turn_messages = within_turn_suffix.items,
-                            .session_grants = if (live_authority) |resolved|
-                                resolved.authority.grants
-                            else
-                                action_grants,
-                            .live_authority = if (live_authority) |resolved| resolved.authority else null,
-                            .advertised_dynamic_tool_names = advertised_dynamic_tool_names,
-                            .max_tool_result_bytes = config.max_tool_result_bytes,
-                            .command_timeout_started_ms = required.command_timeout_started_ms,
-                            .command_replay_capture = required.command_replay_capture,
-                            .command_replay_unavailable = required.command_replay_unavailable,
-                            .lifecycle_id = execution_lifecycle_id,
-                        }) catch |err| {
-                            if (err == error.OutOfMemory) return error.OutOfMemory;
-                            if ((err == error.Cancelled or
-                                err == error.CancelledBeforeExecution) and
-                                config.cancel_flag.load(.seq_cst))
-                            {
-                                if (err == error.CancelledBeforeExecution) {
-                                    sandbox_widening_retry_started = false;
-                                }
-                                break :blk ToolExecutionResult{
-                                    .status = .failure,
-                                    .cancelled = true,
-                                    .model_output = "command cancelled\n",
-                                };
-                            }
-                            break :blk ToolExecutionResult{
-                                .status = .failure,
-                                .model_output = try deps.format_tool_execution_error(
-                                    deps.ctx,
-                                    arena,
-                                    tool_call.name,
-                                    err,
-                                ),
-                            };
-                        };
-                    };
-                    if (execution.sandbox_scope_required != null) {
-                        return error.InvalidSandboxWideningRetry;
-                    }
-                }
-            }
-
             if (execution.cancelled and config.cancel_flag.load(.seq_cst)) {
-                if (sandbox_widening_required) |required| {
-                    if (required.phase == .reactive) {
-                        defer if (required.command_replay_capture) |capture| capture.discard(arena);
-                        defer if (execution.command_replay_capture) |capture| capture.discard(arena);
-                        var retained = if (sandbox_widening_retry_started)
-                            try reactiveSandboxWideningRetryCancelled(
-                                arena,
-                                required,
-                                execution,
-                            )
-                        else
-                            try reactiveSandboxWideningFailure(
-                                arena,
-                                required,
-                                "cancelled",
-                            );
-                        retained.cancelled = true;
-                        runtime_telemetry.traceCancelObserved(step_ctx, true);
-                        var prepared_retained = try runtime_execution_memory.prepareToolModelOutput(
-                            arena,
-                            config,
-                            tool_call,
-                            retained.model_output,
-                        );
-                        applySandboxReplayUnavailable(required, &prepared_retained.memory);
-                        _ = try stream_ctx.provisional_statuses.finishCancelledCall(
-                            deps,
-                            stream_ctx.alloc,
-                            call_allocator,
-                            turn_id,
-                            execution_call,
-                            status_started,
-                            tool_display_target,
-                            retained,
-                            advertised_dynamic_tool_names,
-                        );
-                        try finishPendingCancelledCalls(
-                            deps,
-                            &stream_ctx.provisional_statuses,
-                            stream_ctx.alloc,
-                            arena,
-                            config,
-                            turn_id,
-                            effective_tool_calls[tool_call_index + 1 ..],
-                            advertised_dynamic_tool_names,
-                        );
-                        if (execution_is_command) {
-                            try deps.push_command_output_complete(deps.ctx, execution_lifecycle_id);
-                        }
-                        try runtime_tool_batch.appendToolResultContent(
-                            arena,
-                            &within_turn_suffix,
-                            &completed_tool_names,
-                            &step_batch,
-                            tool_call,
-                            prepared_retained.model_output,
-                            prepared_retained.memory,
-                            .{
-                                .increment_error = true,
-                                .status = .failure,
-                            },
-                        );
-                        try runtime_tool_admission.recordRejectedToolCall(
-                            deps,
-                            arena,
-                            tool_call,
-                            prepared_retained.model_output,
-                            retained.command_result_json,
-                        );
-                        try runtime_tool_batch.drainPendingUserSuffix(arena, &step_batch, &within_turn_suffix);
-                        try runtime_interruption.persistInterruptedTurnOnce(
-                            deps,
-                            finalization,
-                            job,
-                            partial_assistant,
-                            null,
-                            completed_tool_names.items,
-                            &interrupted_persisted,
-                            step_ctx,
-                            within_turn_suffix.items,
-                            stop_state.retained_candidate,
-                            &stop_state.terminal_materializing,
-                        );
-                        finish_trace.finish("interrupted");
-                        return;
-                    }
-                    try runtime_tool_admission.recordRejectedToolCall(
-                        deps,
-                        arena,
-                        tool_call,
-                        "command cancelled\n",
-                        execution.command_result_json,
-                    );
-                }
                 runtime_telemetry.traceCancelObserved(step_ctx, true);
                 defer if (execution.command_replay_capture) |capture| capture.discard(arena);
                 _ = try stream_ctx.provisional_statuses.finishCancelledCall(
@@ -7559,15 +6896,6 @@ fn processQueuedPromptLoop(
                         &.{feedback},
                     );
                 }
-                if (sandbox_widening_feedback) |feedback| {
-                    try appendPermissionFeedbackAfterToolResult(
-                        deps,
-                        arena,
-                        &step_batch,
-                        tool_call.id,
-                        &.{feedback},
-                    );
-                }
                 try runtime_tool_batch.drainPendingUserSuffix(
                     arena,
                     &step_batch,
@@ -7654,15 +6982,6 @@ fn processQueuedPromptLoop(
                 }
             }
             if (permission_outcome.feedback) |feedback| {
-                try appendPermissionFeedbackAfterToolResult(
-                    deps,
-                    arena,
-                    &step_batch,
-                    tool_call.id,
-                    &.{feedback},
-                );
-            }
-            if (sandbox_widening_feedback) |feedback| {
                 try appendPermissionFeedbackAfterToolResult(
                     deps,
                     arena,

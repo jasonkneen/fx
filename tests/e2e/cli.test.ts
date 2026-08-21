@@ -314,7 +314,7 @@ Usage:
 
 Options:
   --auto                Automatically review unresolved permission requests
-  --yolo                Disable permission checks and command sandboxing
+  --yolo                Disable fx permission checks
   --image PATH          Attach an image file; repeat for multiple images
   --json                Emit machine-readable JSON instead of text
   --quiet               Suppress assistant output
@@ -569,8 +569,8 @@ describe("cli: status", () => {
           auth: "missing",
           auth_refreshable: false,
           auth_help: MISSING_AUTH_MESSAGE,
-          sandbox: platform() === "darwin" ? "os" : "none",
         });
+        expect(statusJson).not.toHaveProperty("sandbox");
         expect(doctorJson).toMatchObject({
           auth: "missing",
           auth_refreshable: false,

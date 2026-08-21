@@ -31,7 +31,6 @@ const model_cache_runtime = @import("model_cache_runtime.zig");
 const provider_runtime = @import("provider_runtime.zig");
 const permissions = @import("../permissions/permissions.zig");
 const session_permission_state = @import("../permissions/session_permission_state.zig");
-const sandbox = @import("../permissions/sandbox.zig");
 const skill_commands = @import("../skills/skill_commands.zig");
 const skill_runtime = @import("../skills/skill_runtime.zig");
 const text_utils = @import("../shared/text_utils.zig");
@@ -334,7 +333,6 @@ pub fn Handlers(comptime App: type) type {
                 .manage_images = commandManageImages,
                 .handle_model = commandHandleModel,
                 .show_models = commandShowModels,
-                .handle_provider = commandHandleProvider,
                 .handle_permissions = commandHandlePermissions,
                 .handle_allowlist = commandHandleAllowlist,
                 .show_stats = commandShowStats,
@@ -353,7 +351,6 @@ pub fn Handlers(comptime App: type) type {
                 .paste_clipboard = commandPasteClipboard,
                 .toggle_fast = commandToggleFast,
                 .handle_appearance = commandHandleAppearance,
-                .handle_sandbox = commandHandleSandbox,
                 .handle_statusline = commandHandleStatusline,
                 .rename_session = commandRenameSession,
                 .handle_notifications = commandHandleNotifications,
@@ -579,19 +576,6 @@ pub fn Handlers(comptime App: type) type {
                     .topic = "auth",
                     .tone = .@"error",
                     .body = "logout is not available in this runtime",
-                }, true);
-            }
-        }
-
-        fn commandHandleProvider(ctx: *anyopaque, rest: []const u8) !void {
-            const app: *App = @ptrCast(@alignCast(ctx));
-            if (comptime @hasDecl(App, "runProviderCommand")) {
-                try app.runProviderCommand(rest);
-            } else {
-                try app.writeDomainNotice(.{
-                    .topic = "provider",
-                    .tone = .@"error",
-                    .body = "provider switching is not available in this runtime",
                 }, true);
             }
         }
@@ -1749,7 +1733,6 @@ pub fn Handlers(comptime App: type) type {
             const InputRuntime = @TypeOf(app.input_runtime);
             if (comptime @hasField(InputRuntime, "appearance_menu")) app.input_runtime.appearance_menu.close();
             if (comptime @hasField(InputRuntime, "statusline_menu")) app.input_runtime.statusline_menu.close();
-            if (comptime @hasField(InputRuntime, "sandbox_menu")) app.input_runtime.sandbox_menu.close();
             if (comptime @hasField(InputRuntime, "usage_menu")) app.input_runtime.usage_menu.close(app.alloc);
             if (comptime @hasField(InputRuntime, "workspace_menu")) app.input_runtime.workspace_menu.close();
         }
@@ -1890,21 +1873,6 @@ pub fn Handlers(comptime App: type) type {
                 return;
             };
             try applySettingsCatalogChange(app, change);
-        }
-
-        fn commandHandleSandbox(ctx: *anyopaque, rest: []const u8) !void {
-            const app: *App = @ptrCast(@alignCast(ctx));
-            if (std.mem.trim(u8, rest, " \t").len == 0) {
-                if (comptime @hasField(App, "skills")) app.skills.closeMenu();
-                if (comptime @hasField(App, "model_cache")) app.model_cache.closeMenu();
-                closeHelpMenuIfPresent(app);
-                app.input_runtime.settings_menu.close();
-                closeInlineCommandMenusIfPresent(app);
-                app.input_runtime.sandbox_menu.open();
-                app.shell.render_requests.request(.footer);
-                return;
-            }
-            try handleSandboxCommand(app, rest);
         }
 
         fn commandHandleStatusline(ctx: *anyopaque, rest: []const u8) !void {
@@ -2071,11 +2039,6 @@ fn buildTraceReport(app: anytype) ![]u8 {
     if (app.fast_mode) try out.writer.writeAll("fast_mode: on\n");
     const perm_label = permissions.permissionModeLabel(app.permission_engine.mode);
     try out.writer.print("permission_mode: {s}\n", .{perm_label});
-    const sandbox_label = sandbox.publicModeForBackend(sandbox.effectiveBackend(
-        app.permission_engine.mode,
-        app.permission_state.sandbox_backend,
-    )).label();
-    try out.writer.print("sandbox: {s}\n", .{sandbox_label});
     try out.writer.print("workspace: {s}\n", .{app.workspace_root});
 
     try writeCurrentStateSummary(&out.writer, app, app.alloc);
@@ -3325,45 +3288,6 @@ fn persistMaxxingModeSetting(app: anytype, next: presentation_mode.MaxxingMode, 
     try persistUserPreferences(app, "maxxing", patch, runtime_changed);
 }
 
-fn handleSandboxCommand(app: anytype, rest: []const u8) !void {
-    const trimmed = std.mem.trim(u8, rest, " \t");
-
-    const mode = sandbox.PublicMode.parse(trimmed) orelse {
-        debug_trace.logf("core", "sandbox command rejected arg_bytes={d}", .{trimmed.len});
-        try app.writeDomainNotice(.{ .topic = "sandbox", .tone = .@"error", .body = "Use: os, none" }, true);
-        return;
-    };
-
-    if (mode == .os and !sandbox.osSandboxAvailable()) {
-        debug_trace.logf("core", "sandbox command rejected mode=os reason=unsupported_os_sandbox", .{});
-        try app.writeDomainNotice(.{ .topic = "sandbox", .tone = .warning, .body = sandbox.unsupported_os_sandbox_message }, true);
-        return;
-    }
-
-    const parsed = sandbox.backendForPublicMode(mode);
-    const changed = app_permission_runtime.Runtime(@TypeOf(app.*)).setSandboxBackend(app, parsed);
-
-    if (!changed) {
-        persistSandboxSetting(app, mode.label()) catch |err| {
-            try writeSandboxPersistenceFailure(app, err);
-        };
-        debug_trace.logf("core", "sandbox command unchanged mode={s}", .{mode.label()});
-        const msg = try std.fmt.allocPrint(app.alloc, "already set to {s}", .{mode.label()});
-        defer app.alloc.free(msg);
-        try app.writeDomainNotice(.{ .topic = "sandbox", .tone = .neutral, .body = msg }, true);
-        return;
-    }
-
-    persistSandboxSetting(app, mode.label()) catch |err| {
-        try writeSandboxPersistenceFailure(app, err);
-    };
-
-    debug_trace.logf("core", "sandbox command switched mode={s}", .{mode.label()});
-    const msg = try std.fmt.allocPrint(app.alloc, "switched to {s}", .{mode.label()});
-    defer app.alloc.free(msg);
-    try app.writeDomainNotice(.{ .topic = "sandbox", .tone = .neutral, .body = msg }, true);
-}
-
 fn handleRenameCommand(app: anytype, rest: []const u8) !void {
     const App = @TypeOf(app.*);
     const SessionRuntime = app_session_runtime.Runtime(App);
@@ -3414,7 +3338,6 @@ fn parseStatuslineItem(raw: []const u8) ?config_runtime.StatuslineItem {
 
 fn statuslineItemForSetting(setting: settings_catalog.SettingId) ?config_runtime.StatuslineItem {
     return switch (setting) {
-        .statusline_sandbox => .sandbox,
         .statusline_context => .context,
         .statusline_session => .session,
         .statusline_workspace => .workspace,
@@ -3425,7 +3348,6 @@ fn statuslineItemForSetting(setting: settings_catalog.SettingId) ?config_runtime
 fn statuslineItemEnabled(app: anytype, item: config_runtime.StatuslineItem) bool {
     const App = @TypeOf(app.*);
     return switch (item) {
-        .sandbox => app.statusline_sandbox,
         .context => app.statusline_context,
         .session => app.statusline_session,
         .workspace => if (comptime @hasField(App, "workspace_identity"))
@@ -3439,7 +3361,6 @@ fn assignStatuslineItem(app: anytype, item: config_runtime.StatuslineItem, enabl
     const App = @TypeOf(app.*);
     const current = statuslineItemEnabled(app, item);
     switch (item) {
-        .sandbox => app.statusline_sandbox = enabled,
         .context => app.statusline_context = enabled,
         .session => app.statusline_session = enabled,
         .workspace => if (comptime @hasField(App, "workspace_identity")) {
@@ -3480,7 +3401,7 @@ fn handleStatuslineCommand(app: anytype, rest: []const u8) !void {
         try app.writeDomainNotice(.{
             .topic = "statusline",
             .tone = .@"error",
-            .body = "Use: sandbox, context, session, workspace",
+            .body = "Use: context, session, workspace",
         }, true);
         return;
     };
@@ -3599,7 +3520,6 @@ pub fn settingsCatalogSnapshot(app: anytype) settings_catalog.Snapshot {
             snapshot.maxxing_mode = app.shell.maxxing_mode.label();
         }
     }
-    if (comptime @hasField(App, "statusline_sandbox")) snapshot.statusline_sandbox = app.statusline_sandbox;
     if (comptime @hasField(App, "statusline_context")) snapshot.statusline_context = app.statusline_context;
     if (comptime @hasField(App, "statusline_session")) snapshot.statusline_session = app.statusline_session;
     if (comptime @hasField(App, "workspace_identity")) snapshot.statusline_workspace = app.workspace_identity.enabled;
@@ -3611,9 +3531,6 @@ pub fn settingsCatalogSnapshot(app: anytype) settings_catalog.Snapshot {
             notifications.attention_required,
             notifications.max,
         );
-    }
-    if (comptime @hasField(App, "permission_state")) {
-        snapshot.sandbox = sandbox.publicModeForBackend(app.permission_state.sandbox_backend).label();
     }
     return snapshot;
 }
@@ -3647,7 +3564,7 @@ pub fn applySettingsCatalogMenuChange(app: anytype, change: settings_catalog.Cha
                 runtime_changed,
             );
         },
-        .statusline_sandbox, .statusline_context, .statusline_session, .statusline_workspace => {
+        .statusline_context, .statusline_session, .statusline_workspace => {
             const enabled = parseOnOff(change.value) orelse return error.InvalidSettingsCatalogValue;
             try applyStatuslineItem(
                 app,
@@ -3655,26 +3572,6 @@ pub fn applySettingsCatalogMenuChange(app: anytype, change: settings_catalog.Cha
                 enabled,
                 .silent,
             );
-        },
-        .sandbox => {
-            const mode = sandbox.PublicMode.parse(change.value) orelse return error.InvalidSettingsCatalogValue;
-            if (mode == .os and !sandbox.osSandboxAvailable()) {
-                try app.writeDomainNotice(.{
-                    .topic = "sandbox",
-                    .tone = .warning,
-                    .body = sandbox.unsupported_os_sandbox_message,
-                }, true);
-                return;
-            }
-            _ = app_permission_runtime.Runtime(@TypeOf(app.*)).setSandboxBackend(
-                app,
-                sandbox.backendForPublicMode(mode),
-            );
-            var outcome = config_runtime.setSandbox(app.alloc, app.workspace_root, mode.label()) catch |err| {
-                try writeSandboxPersistenceFailure(app, err);
-                return;
-            };
-            outcome.deinit(app.alloc);
         },
         else => try applySettingsCatalogChange(app, change),
     }
@@ -3706,7 +3603,7 @@ pub fn applySettingsCatalogChange(app: anytype, change: settings_catalog.Change)
         .model => unreachable,
         .input_appearance => try handleInputAppearanceCommand(app, change.value),
         .maxxing_mode => try handleMaxxingCommand(app, change.value),
-        .statusline_sandbox, .statusline_context, .statusline_session, .statusline_workspace => {
+        .statusline_context, .statusline_session, .statusline_workspace => {
             const enabled = parseOnOff(change.value) orelse return error.InvalidSettingsCatalogValue;
             const item = statuslineItemForSetting(change.setting).?;
             if (enabled != statuslineItemEnabled(app, item)) {
@@ -3749,7 +3646,6 @@ pub fn applySettingsCatalogChange(app: anytype, change: settings_catalog.Change)
         },
         .permission_mode => try session_commands.Commands(@TypeOf(app.*)).handlePermissions(app, change.value),
         .sound_level => try handleNotificationsCommand(app, change.value),
-        .sandbox => try handleSandboxCommand(app, change.value),
         .startup_scrollback => {
             const enabled = parseOnOff(change.value) orelse return error.InvalidSettingsCatalogValue;
             try session_commands.Commands(@TypeOf(app.*)).handleSettings(
@@ -3768,30 +3664,6 @@ fn parseOnOff(value: []const u8) ?bool {
     if (std.mem.eql(u8, value, "on")) return true;
     if (std.mem.eql(u8, value, "off")) return false;
     return null;
-}
-
-fn persistSandboxSetting(app: anytype, label: []const u8) !void {
-    if (@hasDecl(@TypeOf(app.*), "persistSandbox")) {
-        try app.persistSandbox(label);
-    } else {
-        var outcome = try config_runtime.setSandbox(app.alloc, app.workspace_root, label);
-        defer outcome.deinit(app.alloc);
-    }
-    try app.writeDomainNotice(.{
-        .topic = "sandbox",
-        .tone = .neutral,
-        .body = "saved to local settings (scope=local)",
-    }, true);
-}
-
-fn writeSandboxPersistenceFailure(app: anytype, err: anyerror) !void {
-    const notice = try std.fmt.allocPrint(
-        app.alloc,
-        "active for this process but not saved to local settings (scope=local, error={s})",
-        .{@errorName(err)},
-    );
-    defer app.alloc.free(notice);
-    try app.writeDomainNotice(.{ .topic = "sandbox", .tone = .warning, .body = notice }, true);
 }
 
 const SurfaceOnlyApp = struct {};
@@ -4010,16 +3882,6 @@ test "quit command requests resume handoff before exit" {
     );
 }
 
-const SandboxCommandFakeWorker = struct {
-    synced: ?worker_runtime.PermissionSnapshot = null,
-    sync_count: usize = 0,
-
-    pub fn syncQueuedPromptPermissionSnapshot(self: *SandboxCommandFakeWorker, snapshot: worker_runtime.PermissionSnapshot) void {
-        self.synced = snapshot;
-        self.sync_count += 1;
-    }
-};
-
 const ClipboardCommandFakeApp = struct {
     const CopyOutcome = enum {
         copied,
@@ -4069,37 +3931,6 @@ const ClipboardCommandFakeApp = struct {
         self.last_topic = notice.topic;
         self.last_tone = notice.tone;
         self.last_body = notice.body;
-    }
-};
-
-const SandboxCommandFakeApp = struct {
-    alloc: std.mem.Allocator,
-    workspace_root: []const u8 = "/tmp/workspace",
-    permission_state: app_permission_runtime.State = .{},
-    permission_engine: struct { mode: types.PermissionMode = .auto } = .{},
-    worker: SandboxCommandFakeWorker = .{},
-    transcript: std.ArrayList(u8) = .empty,
-    persisted: std.ArrayList(u8) = .empty,
-    persist_calls: usize = 0,
-    persist_error: ?anyerror = null,
-    last_tone: ?types.NoticeTone = null,
-
-    fn deinit(self: *SandboxCommandFakeApp) void {
-        self.transcript.deinit(self.alloc);
-        self.persisted.deinit(self.alloc);
-    }
-
-    noinline fn writeDomainNotice(self: *SandboxCommandFakeApp, notice: types.SemanticNotice, _: bool) !void {
-        self.last_tone = notice.tone;
-        try self.transcript.appendSlice(self.alloc, notice.body);
-        try self.transcript.append(self.alloc, '\n');
-    }
-
-    fn persistSandbox(self: *SandboxCommandFakeApp, label: []const u8) !void {
-        self.persist_calls += 1;
-        if (self.persist_error) |err| return err;
-        self.persisted.clearRetainingCapacity();
-        try self.persisted.appendSlice(self.alloc, label);
     }
 };
 
@@ -4283,10 +4114,6 @@ const ChangeCommandFakeApp = struct {
     }
 };
 
-fn runSandboxCommandForTest(app: *SandboxCommandFakeApp, rest: []const u8) !void {
-    try handleSandboxCommand(app, rest);
-}
-
 fn runInputAppearanceCommandForTest(app: *InputAppearanceCommandFakeApp, rest: []const u8) !void {
     try handleInputAppearanceCommand(app, rest);
 }
@@ -4324,13 +4151,6 @@ fn writeTempSkillFile(tmp: *std.testing.TmpDir, sub_path: []const u8, content: [
     var file = try tmp.dir.createFile(io_mod.getIo(), sub_path, .{ .truncate = true });
     defer file.close(io_mod.getIo());
     try file.writeStreamingAll(io_mod.getIo(), content);
-}
-
-fn expectNoHiddenSandboxLabels(text: []const u8) !void {
-    try std.testing.expect(std.mem.find(u8, text, "macos") == null);
-    try std.testing.expect(std.mem.find(u8, text, "auto") == null);
-    try std.testing.expect(std.mem.find(u8, text, "vercel") == null);
-    try std.testing.expect(std.mem.find(u8, text, "just-bash") == null);
 }
 
 test "trace notice distinguishes Markdown file outcomes without a feedback CTA" {
@@ -5101,102 +4921,4 @@ test "maxxing command accepts normal as a hidden legacy alias" {
 
     try std.testing.expectEqual(presentation_mode.MaxxingMode.legacy, app.shell.maxxing_mode);
     try std.testing.expectEqualStrings("legacy", app.persisted_mode);
-}
-
-test "sandbox command unknown argument prints only public usage" {
-    var app = SandboxCommandFakeApp{ .alloc = std.testing.allocator };
-    defer app.deinit();
-
-    try runSandboxCommandForTest(&app, "vercel");
-
-    try std.testing.expect(std.mem.find(u8, app.transcript.items, "Use: os, none") != null);
-    try std.testing.expectEqual(types.NoticeTone.@"error", app.last_tone.?);
-    try std.testing.expectEqual(@as(usize, 0), app.worker.sync_count);
-    try expectNoHiddenSandboxLabels(app.transcript.items);
-}
-
-test "sandbox command switches and persists canonical public labels" {
-    var app = SandboxCommandFakeApp{ .alloc = std.testing.allocator };
-    defer app.deinit();
-
-    if (@import("builtin").os.tag == .macos) {
-        try runSandboxCommandForTest(&app, "os");
-        try std.testing.expectEqual(sandbox.BackendKind.macos, app.permission_state.sandbox_backend);
-        try std.testing.expectEqual(types.PermissionMode.auto, app.worker.synced.?.mode);
-        try std.testing.expectEqual(sandbox.BackendKind.macos, app.worker.synced.?.sandbox_backend);
-        try std.testing.expectEqualStrings("os", app.persisted.items);
-        try std.testing.expect(std.mem.find(u8, app.transcript.items, "switched to os") != null);
-    } else {
-        try runSandboxCommandForTest(&app, "os");
-        try std.testing.expectEqual(sandbox.BackendKind.none, app.permission_state.sandbox_backend);
-        try std.testing.expectEqual(@as(usize, 0), app.worker.sync_count);
-        try std.testing.expectEqual(@as(usize, 0), app.persist_calls);
-        try std.testing.expect(std.mem.find(u8, app.transcript.items, "operating system sandbox is not available") != null);
-    }
-
-    app.permission_state.sandbox_backend = .macos;
-    app.persisted.clearRetainingCapacity();
-    app.persist_calls = 0;
-    app.transcript.clearRetainingCapacity();
-    try runSandboxCommandForTest(&app, "none");
-    try std.testing.expectEqual(sandbox.BackendKind.none, app.permission_state.sandbox_backend);
-    try std.testing.expectEqual(types.PermissionMode.auto, app.worker.synced.?.mode);
-    try std.testing.expectEqual(sandbox.BackendKind.none, app.worker.synced.?.sandbox_backend);
-    try std.testing.expectEqual(@as(usize, 1), app.persist_calls);
-    try std.testing.expectEqualStrings("none", app.persisted.items);
-    try std.testing.expect(std.mem.find(u8, app.transcript.items, "switched to none") != null);
-    try expectNoHiddenSandboxLabels(app.transcript.items);
-}
-
-test "sandbox command persists explicit unchanged public label" {
-    var app = SandboxCommandFakeApp{ .alloc = std.testing.allocator };
-    defer app.deinit();
-
-    try runSandboxCommandForTest(&app, "none");
-
-    try std.testing.expectEqual(sandbox.BackendKind.none, app.permission_state.sandbox_backend);
-    try std.testing.expectEqual(@as(usize, 1), app.worker.sync_count);
-    try std.testing.expectEqual(sandbox.BackendKind.none, app.worker.synced.?.sandbox_backend);
-    try std.testing.expectEqual(@as(usize, 1), app.persist_calls);
-    try std.testing.expectEqualStrings("none", app.persisted.items);
-    try std.testing.expect(std.mem.find(u8, app.transcript.items, "already set to none") != null);
-    try expectNoHiddenSandboxLabels(app.transcript.items);
-}
-
-test "sandbox command reports runtime state when local persistence fails" {
-    var app = SandboxCommandFakeApp{
-        .alloc = std.testing.allocator,
-        .permission_state = .{ .sandbox_backend = .macos },
-        .persist_error = error.AccessDenied,
-    };
-    defer app.deinit();
-
-    try runSandboxCommandForTest(&app, "none");
-
-    try std.testing.expectEqual(sandbox.BackendKind.none, app.permission_state.sandbox_backend);
-    try std.testing.expectEqual(@as(usize, 1), app.worker.sync_count);
-    try std.testing.expectEqual(@as(usize, 1), app.persist_calls);
-    try std.testing.expectEqual(@as(usize, 0), app.persisted.items.len);
-    try std.testing.expect(std.mem.find(
-        u8,
-        app.transcript.items,
-        "active for this process but not saved to local settings (scope=local, error=AccessDenied)",
-    ) != null);
-    try std.testing.expect(std.mem.find(u8, app.transcript.items, "switched to none") != null);
-}
-
-test "sandbox unchanged selection stays explicit when persistence fails" {
-    var app = SandboxCommandFakeApp{
-        .alloc = std.testing.allocator,
-        .persist_error = error.AccessDenied,
-    };
-    defer app.deinit();
-
-    try runSandboxCommandForTest(&app, "none");
-
-    try std.testing.expectEqual(sandbox.BackendKind.none, app.permission_state.sandbox_backend);
-    try std.testing.expectEqual(@as(usize, 1), app.worker.sync_count);
-    try std.testing.expectEqual(@as(usize, 1), app.persist_calls);
-    try std.testing.expect(std.mem.find(u8, app.transcript.items, "active for this process but not saved") != null);
-    try std.testing.expect(std.mem.find(u8, app.transcript.items, "already set to none") != null);
 }

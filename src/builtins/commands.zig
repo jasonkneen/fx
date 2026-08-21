@@ -34,7 +34,7 @@ pub const top_level_specs = [_]TopLevelSpec{
         .summary = "Run one noninteractive request",
         .options = &.{
             .{ .flag = "--auto", .description = "Automatically review unresolved permission requests" },
-            .{ .flag = "--yolo", .description = "Disable permission checks and command sandboxing" },
+            .{ .flag = "--yolo", .description = "Disable fx permission checks" },
             .{ .flag = "--image PATH", .description = "Attach an image file; repeat for multiple images" },
             json_option,
             .{ .flag = "--quiet", .description = "Suppress assistant output" },
@@ -89,13 +89,13 @@ pub const top_level_specs = [_]TopLevelSpec{
     .{
         .kind = .login,
         .token = "login",
-        .usage = "login [vercel|codex]",
+        .usage = "login [vercel|codex|grok]",
         .summary = "Sign in to Vercel or a selected provider",
     },
     .{
         .kind = .logout,
         .token = "logout",
-        .usage = "logout [vercel|codex]",
+        .usage = "logout [vercel|codex|grok]",
         .summary = "Sign out of Vercel or a selected provider session",
     },
     .{
@@ -121,7 +121,7 @@ pub const top_level_specs = [_]TopLevelSpec{
             "Modes:",
             "  ask    Prompt before sensitive tool calls",
             "  auto   Apply rules, then review unresolved sensitive tool calls (default)",
-            "  yolo   Disable fx permissions and sandboxing",
+            "  yolo   Disable fx permission checks",
             "",
             "Change the mode from the interactive shell with `/permissions [ask|auto|yolo|reset]`,",
             "and manage persistent allow rules with `/allowlist`.",
@@ -137,7 +137,7 @@ pub const top_level_specs = [_]TopLevelSpec{
     .{
         .kind = .provider,
         .token = "provider",
-        .usage = "provider <gateway|codex>",
+        .usage = "provider <gateway|codex|grok>",
         .summary = "Choose the model provider used by fx",
     },
     .{
@@ -292,9 +292,9 @@ pub const top_level_help_groups = [_]TopLevelHelpGroup{
         .{ .kind = .replay, .usage = "replay <tape>" },
     } },
     .{ .entries = &.{
-        .{ .kind = .login, .usage = "login [vercel|codex]" },
-        .{ .kind = .logout, .usage = "logout [vercel|codex]" },
-        .{ .kind = .provider, .usage = "provider <gateway|codex>" },
+        .{ .kind = .login, .usage = "login [vercel|codex|grok]" },
+        .{ .kind = .logout, .usage = "logout [vercel|codex|grok]" },
+        .{ .kind = .provider, .usage = "provider <gateway|codex|grok>" },
         .{ .kind = .setup, .usage = "setup" },
         .{ .kind = .teams, .usage = "teams" },
         .{ .kind = .credits, .usage = "credits|balance" },
@@ -420,7 +420,7 @@ pub const slash_specs = [_]SlashSpec{
     .{ .kind = .continue_recovery, .command = "/continue", .help_entry = "/continue", .completion_description = "continue a paused model response", .presentation_category = .session, .requires_prompt_credential = true },
     .{ .kind = .rename_session, .command = "/rename", .help_entry = "/rename <title>", .completion_description = "rename the current session", .presentation_category = .session, .has_args = true, .accepts_payload = true },
     .{ .kind = .login, .command = "/login", .help_entry = "/login", .completion_description = "choose Vercel or Codex sign-in", .presentation_category = .account },
-    .{ .kind = .logout, .command = "/logout", .help_entry = "/logout [vercel|codex]", .completion_description = "sign out of a provider session", .presentation_category = .account, .has_args = true, .accepts_payload = true },
+    .{ .kind = .logout, .command = "/logout", .help_entry = "/logout [vercel|codex|grok]", .completion_description = "sign out of a provider session", .presentation_category = .account, .has_args = true, .accepts_payload = true },
     .{ .kind = .setup, .command = "/setup", .help_entry = "/setup", .completion_description = "manage accounts and AI Gateway access", .presentation_category = .account },
     .{ .kind = .stats, .command = "/stats", .help_entry = "/stats", .completion_description = "show token and turn statistics", .presentation_category = .account },
     .{ .kind = .usage, .command = "/usage", .aliases = &.{"/cost"}, .help_entry = "/usage (/cost)", .completion_description = "show local fx tokens, models, and spend", .presentation_category = .account },
@@ -433,7 +433,6 @@ pub const slash_specs = [_]SlashSpec{
     .{ .kind = .images, .command = "/images", .help_entry = "/images [clear]", .completion_description = "manage pending image attachments", .presentation_category = .media, .has_args = true, .accepts_payload = true },
     .{ .kind = .model, .command = "/model", .help_entry = "/model <id-or-query>", .completion_description = "choose what model and reasoning effort to use", .presentation_category = .model, .has_args = true, .accepts_payload = true },
     .{ .kind = .models, .command = "/models", .help_entry = "/models", .completion_description = "browse available models", .presentation_category = .model },
-    .{ .kind = .provider, .command = "/provider", .help_entry = "/provider [gateway|codex]", .completion_description = "choose Gateway or Codex", .presentation_category = .model, .has_args = true, .accepts_payload = true },
     .{ .kind = .permissions, .command = "/permissions", .help_entry = "/permissions [ask|auto|yolo|reset]", .completion_description = "choose what fx is allowed to do", .presentation_category = .security, .show_in_welcome = true, .has_args = true, .accepts_payload = true },
     .{ .kind = .allowlist, .command = "/allowlist", .help_entry = "/allowlist [view [effective|local|user]|[local|user] add|remove|reset ...]", .completion_description = "manage trusted commands, tools, and URLs", .presentation_category = .security, .show_in_welcome = true, .has_args = true, .accepts_payload = true },
     .{ .kind = .undo, .command = "/undo", .help_entry = "/undo", .completion_description = "undo the latest tracked file operation", .presentation_category = .session },
@@ -450,8 +449,7 @@ pub const slash_specs = [_]SlashSpec{
     .{ .kind = .paste, .command = "/paste", .help_entry = "/paste", .completion_description = "attach an image from the clipboard when supported", .presentation_category = .media },
     .{ .kind = .fast, .command = "/fast", .help_entry = "/fast", .completion_description = "toggle Fast mode when supported", .presentation_category = .model },
     .{ .kind = .appearance, .command = "/appearance", .aliases = &.{ "/input", "/maxxing" }, .show_aliases_in_completion = false, .help_entry = "/appearance [input lines|tint|presentation normal|minimal]", .completion_description = "choose input and transcript presentation", .presentation_category = .appearance, .has_args = true, .accepts_payload = true },
-    .{ .kind = .sandbox, .command = "/sandbox", .help_entry = "/sandbox [os|none]", .completion_description = "choose command sandbox behavior", .presentation_category = .security, .has_args = true, .accepts_payload = true },
-    .{ .kind = .statusline, .command = "/statusline", .help_entry = "/statusline [sandbox|context|session|workspace]", .completion_description = "toggle status line segments", .presentation_category = .appearance, .has_args = true, .accepts_payload = true },
+    .{ .kind = .statusline, .command = "/statusline", .help_entry = "/statusline [context|session|workspace]", .completion_description = "toggle status line segments", .presentation_category = .appearance, .has_args = true, .accepts_payload = true },
     .{ .kind = .notifications, .command = "/sound", .help_entry = "/sound [on|off|max]", .completion_description = "toggle sounds and terminal bells", .presentation_category = .appearance, .has_args = true, .accepts_payload = true },
     .{ .kind = .workspace, .command = "/workspace", .help_entry = "/workspace [list|add PATH|remove PATH|clear]", .completion_description = "manage additional workspace directories", .presentation_category = .workspace, .show_in_welcome = true, .has_args = true, .accepts_payload = true },
     .{ .kind = .version, .command = "/version", .help_entry = "/version", .completion_description = "show the fx version", .presentation_category = .general },
@@ -514,7 +512,6 @@ pub const allowlistArgCompletionPrefix = command_specs.allowlistArgCompletionPre
 pub const appearanceArgCompletionPrefix = command_specs.appearanceArgCompletionPrefix;
 pub const inputArgCompletionPrefix = command_specs.inputArgCompletionPrefix;
 pub const maxxingArgCompletionPrefix = command_specs.maxxingArgCompletionPrefix;
-pub const sandboxArgCompletionPrefix = command_specs.sandboxArgCompletionPrefix;
 pub const statuslineArgCompletionPrefix = command_specs.statuslineArgCompletionPrefix;
 pub const notificationsArgCompletionPrefix = command_specs.notificationsArgCompletionPrefix;
 pub const permissionsArgCompletionPrefix = command_specs.permissionsArgCompletionPrefix;
@@ -542,7 +539,6 @@ test "built-in slash commands register exact active order" {
         "/images",
         "/model",
         "/models",
-        "/provider",
         "/permissions",
         "/allowlist",
         "/undo",
@@ -559,7 +555,6 @@ test "built-in slash commands register exact active order" {
         "/paste",
         "/fast",
         "/appearance",
-        "/sandbox",
         "/statusline",
         "/sound",
         "/workspace",
@@ -618,7 +613,7 @@ test "built-in statusline help and completion include workspace" {
     const help = try renderSlashHelp(std.testing.allocator);
     defer std.testing.allocator.free(help);
     try std.testing.expect(
-        std.mem.find(u8, help, "/statusline [sandbox|context|session|workspace]") != null,
+        std.mem.find(u8, help, "/statusline [context|session|workspace]") != null,
     );
 
     try std.testing.expectEqualStrings(

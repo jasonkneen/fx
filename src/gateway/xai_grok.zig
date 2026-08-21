@@ -1,6 +1,6 @@
 const std = @import("std");
-const chatgpt_oauth = @import("../core/auth/chatgpt_oauth.zig");
 const image_attachments = @import("../core/images/image_attachments.zig");
+const grok_session = @import("../core/auth/grok_session.zig");
 const secret = @import("../core/auth/secret.zig");
 const stream_provider = @import("../core/agent/stream_provider.zig");
 const io_mod = @import("../core/shared/io.zig");
@@ -8,11 +8,13 @@ const types = @import("../core/shared/types.zig");
 const gateway_client = @import("client.zig");
 
 const Allocator = std.mem.Allocator;
-const endpoint = "https://chatgpt.com/backend-api/codex/responses";
-const generation_origin = "https://chatgpt.com/backend-api/codex";
-const e2e_endpoint_env = "FX_E2E_OPENAI_CODEX_RESPONSES_URL";
-const max_error_body_bytes: usize = 1024 * 1024;
-const max_sse_line_bytes: usize = 32 * 1024 * 1024;
+const endpoint = "https://cli-chat-proxy.grok.com/v1/responses";
+const generation_origin = "https://cli-chat-proxy.grok.com/v1";
+// The proxy gates this as Grok wire compatibility; fx identifies itself separately below.
+const proxy_compatibility_version = "1.0.6";
+const e2e_endpoint_env = "FX_E2E_XAI_GROK_RESPONSES_URL";
+const max_error_body_bytes: usize = 256 * 1024;
+const max_sse_line_bytes: usize = 1024 * 1024;
 const max_sse_aggregate_bytes: usize = 64 * 1024 * 1024;
 const max_sse_events: usize = 100_000;
 const max_tool_calls: usize = 128;
@@ -22,45 +24,19 @@ const max_provider_state_bytes: usize = 4 * 1024 * 1024;
 const transfer_buffer_bytes: usize = 256 * 1024;
 const connect_timeout_ms: i64 = 30_000;
 
-const CodexLimits = struct {
-    aggregate_bytes: usize = max_sse_aggregate_bytes,
-    events: usize = max_sse_events,
-    tool_calls: usize = max_tool_calls,
-    tool_identity_bytes: usize = max_tool_identity_bytes,
-    tool_arguments_bytes: usize = max_tool_arguments_bytes,
-    provider_state_bytes: usize = max_provider_state_bytes,
-};
-
 pub const agent_stream_provider = stream_provider.Provider{
     .build_fn = buildRequest,
     .stream_fn = streamCompletion,
 };
 
 fn validateModel(model: []const u8) !void {
-    if (model.len == 0 or model.len > 1024) return error.InvalidOpenAICodexModel;
+    if (model.len == 0 or model.len > 256) return error.InvalidXaiGrokModel;
     for (model) |byte| {
-        if (byte <= 0x20 or byte == 0x7f) return error.InvalidOpenAICodexModel;
+        if (byte <= 0x20 or byte == 0x7f) return error.InvalidXaiGrokModel;
     }
 }
 
-fn validateReplayMessage(message: types.ChatMessage, limits: CodexLimits) !void {
-    if (message.provider_state_json) |state_json| {
-        if (state_json.len > limits.provider_state_bytes) return error.OpenAICodexProviderStateTooLarge;
-    }
-    if (message.tool_calls.len > limits.tool_calls) return error.OpenAICodexToolCallLimitExceeded;
-    for (message.tool_calls) |call| {
-        if (call.id.len == 0 or call.id.len > limits.tool_identity_bytes or
-            call.name.len == 0 or call.name.len > limits.tool_identity_bytes)
-        {
-            return error.OpenAICodexToolCallLimitExceeded;
-        }
-        if (call.arguments_json.len > limits.tool_arguments_bytes) {
-            return error.OpenAICodexToolArgumentsTooLarge;
-        }
-    }
-}
-
-pub fn buildRequest(
+fn buildRequest(
     _: ?*anyopaque,
     alloc: Allocator,
     request: stream_provider.BuildRequest,
@@ -97,10 +73,6 @@ pub fn buildRequest(
     try writer.writeAll(",\"tool_choice\":");
     try std.json.Stringify.value(request.tool_choice.label(), .{}, writer);
     try writer.writeAll(",\"parallel_tool_calls\":true,\"include\":[\"reasoning.encrypted_content\"]");
-    // Codex exposes Fast mode as its priority service tier for supported
-    // ChatGPT subscription models.
-    if (request.provider_options.fast) try writer.writeAll(",\"service_tier\":\"priority\"");
-
     try writer.writeAll(",\"text\":{\"verbosity\":\"low\"");
     if (request.response_format) |format| {
         var schema = try std.json.parseFromSlice(std.json.Value, alloc, format.schema_json, .{});
@@ -117,13 +89,11 @@ pub fn buildRequest(
     try writer.writeByte('}');
 
     if (request.provider_options.reasoning) |effort| {
-        const label = if (std.mem.eql(u8, effort.label(), "minimal")) "low" else effort.label();
         try writer.writeAll(",\"reasoning\":{\"effort\":");
-        try std.json.Stringify.value(label, .{}, writer);
+        try std.json.Stringify.value(effort.label(), .{}, writer);
         try writer.writeAll(",\"summary\":\"auto\"}");
     }
-    // The ChatGPT Codex endpoint chooses the model's output limit and rejects
-    // the public Responses API max_output_tokens parameter.
+    if (request.max_output_tokens) |limit| try writer.print(",\"max_output_tokens\":{d}", .{limit});
     try writer.writeByte('}');
     return out.toOwnedSlice();
 }
@@ -160,14 +130,14 @@ fn writeInput(
                 try writer.writeAll("]}");
             },
             .assistant => {
-                try validateReplayMessage(message, .{});
                 if (message.provider_state_json) |state_json| {
+                    if (state_json.len > max_provider_state_bytes) return error.XaiGrokProviderStateTooLarge;
                     var state = std.json.parseFromSlice(std.json.Value, alloc, state_json, .{}) catch
-                        return error.InvalidOpenAICodexProviderState;
+                        return error.InvalidXaiGrokProviderState;
                     defer state.deinit();
-                    if (state.value != .array) return error.InvalidOpenAICodexProviderState;
+                    if (state.value != .array) return error.InvalidXaiGrokProviderState;
                     for (state.value.array.items) |item| {
-                        if (item != .object) return error.InvalidOpenAICodexProviderState;
+                        if (item != .object) return error.InvalidXaiGrokProviderState;
                         try writeComma(writer, &first);
                         try std.json.Stringify.value(item, .{}, writer);
                     }
@@ -179,6 +149,12 @@ fn writeInput(
                     try writer.writeAll(",\"annotations\":[]}]}");
                 };
                 for (message.tool_calls) |call| {
+                    if (call.id.len == 0 or call.id.len > max_tool_identity_bytes or
+                        call.name.len == 0 or call.name.len > max_tool_identity_bytes or
+                        call.arguments_json.len > max_tool_arguments_bytes)
+                    {
+                        return error.XaiGrokToolCallLimitExceeded;
+                    }
                     try writeComma(writer, &first);
                     try writer.writeAll("{\"type\":\"function_call\",\"call_id\":");
                     try std.json.Stringify.value(call.id, .{}, writer);
@@ -277,11 +253,23 @@ fn streamCompletion(
     alloc: Allocator,
     request: stream_provider.Request,
 ) !stream_provider.Result {
-    return streamCompletionCore(alloc, request) catch |err| {
+    var result = streamCompletionCore(alloc, request) catch |err| {
         if (request.cancel_flag.load(.seq_cst)) return error.Cancelled;
+        if (requestDeadlineExpired(request)) return error.Timeout;
         request.attempt_evidence.network_failure = gateway_client.networkFailureEvidence(err, request.delivery.load());
         return err;
     };
+    if (requestDeadlineExpired(request)) {
+        result.deinit(alloc);
+        return error.Timeout;
+    }
+    return result;
+}
+
+fn requestDeadlineExpired(request: stream_provider.Request) bool {
+    const deadline = request.deadline orelse return false;
+    const now = std.Io.Clock.Timestamp.now(io_mod.getIo(), .awake);
+    return !std.Io.Clock.Timestamp.compare(now, .lt, deadline);
 }
 
 const OpenedRequest = struct {
@@ -322,34 +310,38 @@ const OpenRequestOperation = struct {
 
 fn streamCompletionCore(alloc: Allocator, request: stream_provider.Request) !stream_provider.Result {
     if (request.cancel_flag.load(.seq_cst)) return error.Cancelled;
-    if (request.credential_source != .chatgpt_subscription) {
-        return error.CodexSubscriptionCredentialRequired;
+    if (request.credential_source != .grok_subscription) {
+        return error.GrokSubscriptionCredentialRequired;
     }
+    const account_id = request.account_id orelse return error.GrokSubscriptionAccountRequired;
+    if (!grok_session.validAccountId(account_id)) return error.InvalidGrokSubscriptionAccount;
     try validateModel(request.model);
-    const account_id = try chatgpt_oauth.extractAccountId(alloc, request.api_key);
-    defer alloc.free(account_id);
     const auth_header = try std.fmt.allocPrint(alloc, "Bearer {s}", .{request.api_key});
     defer secret.zeroAndFree(alloc, auth_header);
     const request_endpoint = if (io_mod.getenv(e2e_endpoint_env)) |override| endpoint: {
-        if (!gateway_client.isLoopbackHttpUrl(override)) return error.InvalidE2EOpenAICodexEndpoint;
+        if (!gateway_client.isLoopbackHttpUrl(override)) return error.InvalidE2EXaiGrokEndpoint;
         break :endpoint override;
     } else endpoint;
     const uri = try std.Uri.parse(request_endpoint);
 
-    var extra_headers_buf: [7]std.http.Header = undefined;
+    var extra_headers_buf: [8]std.http.Header = undefined;
     var extra_count: usize = 0;
-    extra_headers_buf[extra_count] = .{ .name = "chatgpt-account-id", .value = account_id };
-    extra_count += 1;
-    extra_headers_buf[extra_count] = .{ .name = "originator", .value = "fx" };
-    extra_count += 1;
-    extra_headers_buf[extra_count] = .{ .name = "OpenAI-Beta", .value = "responses=experimental" };
-    extra_count += 1;
     extra_headers_buf[extra_count] = .{ .name = "accept", .value = "text/event-stream" };
     extra_count += 1;
+    extra_headers_buf[extra_count] = .{ .name = "X-XAI-Token-Auth", .value = "xai-grok-cli" };
+    extra_count += 1;
+    extra_headers_buf[extra_count] = .{ .name = "x-authenticateresponse", .value = "authenticate-response" };
+    extra_count += 1;
+    extra_headers_buf[extra_count] = .{ .name = "x-grok-client-version", .value = proxy_compatibility_version };
+    extra_count += 1;
+    extra_headers_buf[extra_count] = .{ .name = "x-grok-client-identifier", .value = "fx" };
+    extra_count += 1;
+    extra_headers_buf[extra_count] = .{ .name = "x-grok-model-override", .value = request.model };
+    extra_count += 1;
+    extra_headers_buf[extra_count] = .{ .name = "x-grok-user-id", .value = account_id };
+    extra_count += 1;
     if (request.session_id) |session_id| if (session_id.len > 0) {
-        extra_headers_buf[extra_count] = .{ .name = "session-id", .value = session_id };
-        extra_count += 1;
-        extra_headers_buf[extra_count] = .{ .name = "x-client-request-id", .value = session_id };
+        extra_headers_buf[extra_count] = .{ .name = "x-grok-conv-id", .value = session_id };
         extra_count += 1;
     };
 
@@ -361,10 +353,15 @@ fn streamCompletionCore(alloc: Allocator, request: stream_provider.Request) !str
         .auth_header = auth_header,
         .extra_headers = extra_headers_buf[0..extra_count],
     };
-    const connect_deadline = std.Io.Clock.Timestamp.fromNow(io_mod.getIo(), .{
+    var connect_deadline = std.Io.Clock.Timestamp.fromNow(io_mod.getIo(), .{
         .clock = .awake,
         .raw = .fromMilliseconds(connect_timeout_ms),
     });
+    if (request.deadline) |deadline| {
+        if (std.Io.Clock.Timestamp.compare(deadline, .lt, connect_deadline)) {
+            connect_deadline = deadline;
+        }
+    }
     var opened = try gateway_client.runBoundedHttpOperation(
         OpenedRequest,
         alloc,
@@ -376,11 +373,19 @@ fn streamCompletionCore(alloc: Allocator, request: stream_provider.Request) !str
     defer http_request.deinit();
     var cancel_watch_done = std.atomic.Value(bool).init(false);
     const cancel_watcher = if (http_request.connection) |connection|
-        try gateway_client.spawnHttpCancelWatcher(
-            &cancel_watch_done,
-            request.cancel_flag,
-            connection.stream_writer.stream,
-        )
+        if (request.deadline) |deadline|
+            try gateway_client.spawnHttpCancelWatcherBounded(
+                &cancel_watch_done,
+                request.cancel_flag,
+                deadline,
+                connection.stream_writer.stream,
+            )
+        else
+            try gateway_client.spawnHttpCancelWatcher(
+                &cancel_watch_done,
+                request.cancel_flag,
+                connection.stream_writer.stream,
+            )
     else
         null;
     defer {
@@ -402,10 +407,14 @@ fn streamCompletionCore(alloc: Allocator, request: stream_provider.Request) !str
     if (response.head.status != .ok) {
         var transfer: [16 * 1024]u8 = undefined;
         const reader = response.reader(&transfer);
-        const body = reader.allocRemaining(alloc, .limited(max_error_body_bytes)) catch |err| switch (err) {
-            error.StreamTooLong => try alloc.dupe(u8, "OpenAI Codex error response exceeded the local limit"),
+        const bounded_body = reader.allocRemaining(alloc, .limited(max_error_body_bytes + 1)) catch |err| switch (err) {
+            error.StreamTooLong => try alloc.dupe(u8, "xAI Grok error response exceeded the local limit"),
             else => return err,
         };
+        const body = if (bounded_body.len > max_error_body_bytes) body: {
+            alloc.free(bounded_body);
+            break :body try alloc.dupe(u8, "xAI Grok error response exceeded the local limit");
+        } else bounded_body;
         return .{
             .status = response.head.status,
             .err_body = body,
@@ -425,7 +434,6 @@ fn streamCompletionCore(alloc: Allocator, request: stream_provider.Request) !str
         request.on_tool_input_chunk,
         request.cancel_flag,
         request.content_capture_limit,
-        .{},
     );
     return .{
         .status = .ok,
@@ -451,6 +459,12 @@ const ToolAccumulator = struct {
 
 const SseReader = struct {
     pending_line: std.ArrayList(u8) = .empty,
+    aggregate_bytes: usize = 0,
+
+    const Line = struct {
+        bytes: []const u8,
+        wire_bytes: usize,
+    };
 
     fn deinit(self: *SseReader, alloc: Allocator) void {
         self.pending_line.deinit(alloc);
@@ -463,7 +477,12 @@ const SseReader = struct {
     fn next(self: *SseReader, alloc: Allocator, reader: anytype) !?[]const u8 {
         while (true) {
             const line = try self.readLine(alloc, reader) orelse return null;
-            const trimmed = std.mem.trim(u8, line, " \t\r");
+            self.aggregate_bytes = try checkedAccumulatedSize(
+                self.aggregate_bytes,
+                line.wire_bytes,
+                max_sse_aggregate_bytes,
+            );
+            const trimmed = std.mem.trim(u8, line.bytes, " \t\r");
             if (trimmed.len == 0 or trimmed[0] == ':') {
                 self.release();
                 continue;
@@ -478,14 +497,14 @@ const SseReader = struct {
         }
     }
 
-    fn readLine(self: *SseReader, alloc: Allocator, reader: anytype) !?[]const u8 {
+    fn readLine(self: *SseReader, alloc: Allocator, reader: anytype) !?Line {
         while (true) {
             const fragment = reader.takeDelimiter('\n') catch |err| switch (err) {
                 error.StreamTooLong => {
                     const buffered = reader.buffered();
-                    if (buffered.len == 0) return error.OpenAICodexSseReadStalled;
+                    if (buffered.len == 0) return error.XaiGrokSseReadStalled;
                     if (buffered.len > max_sse_line_bytes - self.pending_line.items.len) {
-                        return error.OpenAICodexSseEventTooLarge;
+                        return error.XaiGrokSseEventTooLarge;
                     }
                     try self.pending_line.appendSlice(alloc, buffered);
                     reader.tossBuffered();
@@ -493,15 +512,28 @@ const SseReader = struct {
                 },
                 error.ReadFailed => return error.ReadFailed,
             } orelse {
-                if (self.pending_line.items.len > 0) return self.pending_line.items;
+                if (self.pending_line.items.len > 0) {
+                    return .{
+                        .bytes = self.pending_line.items,
+                        .wire_bytes = self.pending_line.items.len,
+                    };
+                }
                 return null;
             };
             if (fragment.len > max_sse_line_bytes - self.pending_line.items.len) {
-                return error.OpenAICodexSseEventTooLarge;
+                return error.XaiGrokSseEventTooLarge;
             }
-            if (self.pending_line.items.len == 0) return fragment;
+            if (self.pending_line.items.len == 0) {
+                return .{
+                    .bytes = fragment,
+                    .wire_bytes = fragment.len + 1,
+                };
+            }
             try self.pending_line.appendSlice(alloc, fragment);
-            return self.pending_line.items;
+            return .{
+                .bytes = self.pending_line.items,
+                .wire_bytes = self.pending_line.items.len + 1,
+            };
         }
     }
 };
@@ -516,7 +548,6 @@ fn consumeSse(
     on_tool_input_chunk: ?stream_provider.StreamCallback,
     cancel_flag: *std.atomic.Value(bool),
     content_capture_limit: ?usize,
-    limits: CodexLimits,
 ) !types.GatewayCompletion {
     var content: std.ArrayList(u8) = .empty;
     errdefer content.deinit(alloc);
@@ -537,15 +568,13 @@ fn consumeSse(
     var terminal_seen = false;
     var saw_content_delta = false;
     var event_count: usize = 0;
-    var aggregate_bytes: usize = 0;
 
     while (try sse.next(alloc, reader)) |json_text| {
         defer sse.release();
         if (cancel_flag.load(.seq_cst)) return error.Cancelled;
-        event_count = try checkedAccumulatedSize(event_count, 1, limits.events);
-        aggregate_bytes = try checkedAccumulatedSize(aggregate_bytes, json_text.len, limits.aggregate_bytes);
+        event_count = try checkedAccumulatedSize(event_count, 1, max_sse_events);
         var parsed = std.json.parseFromSlice(std.json.Value, alloc, json_text, .{}) catch
-            return error.InvalidOpenAICodexSseEvent;
+            return error.InvalidXaiGrokSseEvent;
         defer parsed.deinit();
         if (parsed.value != .object) continue;
         const event_type = stringField(parsed.value.object, "type") orelse continue;
@@ -559,7 +588,7 @@ fn consumeSse(
                 const call_id = stringField(item.object, "call_id") orelse continue;
                 const name = stringField(item.object, "name") orelse continue;
                 if (findTool(tools.items, output_index) == null) {
-                    try appendTool(alloc, &tools, output_index, call_id, name, limits);
+                    try appendTool(alloc, &tools, output_index, call_id, name);
                     if (on_tool_start) |callback| callback(callback_ctx, call_id, name, null);
                 }
             }
@@ -581,7 +610,7 @@ fn consumeSse(
             const output_index = integerField(parsed.value.object, "output_index") orelse continue;
             const delta = stringField(parsed.value.object, "delta") orelse continue;
             const index = findTool(tools.items, output_index) orelse continue;
-            try appendToolArguments(alloc, &tools.items[index].arguments, delta, limits.tool_arguments_bytes);
+            try appendToolArguments(alloc, &tools.items[index].arguments, delta);
             if (on_tool_input_chunk) |callback| callback(callback_ctx, delta);
         } else if (std.mem.eql(u8, event_type, "response.function_call_arguments.done")) {
             const output_index = integerField(parsed.value.object, "output_index") orelse continue;
@@ -590,11 +619,11 @@ fn consumeSse(
             const previous_len = tools.items[index].arguments.items.len;
             if (std.mem.startsWith(u8, arguments, tools.items[index].arguments.items)) {
                 const suffix = arguments[previous_len..];
-                try appendToolArguments(alloc, &tools.items[index].arguments, suffix, limits.tool_arguments_bytes);
+                try appendToolArguments(alloc, &tools.items[index].arguments, suffix);
                 if (suffix.len > 0) if (on_tool_input_chunk) |callback| callback(callback_ctx, suffix);
             } else {
                 tools.items[index].arguments.clearRetainingCapacity();
-                try appendToolArguments(alloc, &tools.items[index].arguments, arguments, limits.tool_arguments_bytes);
+                try appendToolArguments(alloc, &tools.items[index].arguments, arguments);
             }
         } else if (std.mem.eql(u8, event_type, "response.output_item.done")) {
             const output_index = integerField(parsed.value.object, "output_index") orelse continue;
@@ -605,7 +634,7 @@ fn consumeSse(
                 if (findTool(tools.items, output_index)) |index| {
                     if (stringField(item.object, "arguments")) |arguments| {
                         if (tools.items[index].arguments.items.len == 0) {
-                            try appendToolArguments(alloc, &tools.items[index].arguments, arguments, limits.tool_arguments_bytes);
+                            try appendToolArguments(alloc, &tools.items[index].arguments, arguments);
                         }
                     }
                 }
@@ -615,8 +644,9 @@ fn consumeSse(
                 var encoded: std.Io.Writer.Allocating = .init(alloc);
                 defer encoded.deinit();
                 try std.json.Stringify.value(item, .{}, &encoded.writer);
-                const framed_size = try checkedAccumulatedSize(encoded.written().len, 2, limits.provider_state_bytes);
-                _ = try checkedAccumulatedSize(provider_state.written().len, framed_size, limits.provider_state_bytes);
+                const separators: usize = if (provider_state_count == 0) 2 else 1;
+                const encoded_size = try checkedAccumulatedSize(encoded.written().len, separators, max_provider_state_bytes);
+                _ = try checkedAccumulatedSize(provider_state.written().len, encoded_size, max_provider_state_bytes);
                 if (provider_state_count == 0) {
                     try provider_state.writer.writeByte('[');
                 } else {
@@ -651,17 +681,20 @@ fn consumeSse(
         } else if (std.mem.eql(u8, event_type, "response.failed") or
             std.mem.eql(u8, event_type, "error"))
         {
-            return error.OpenAICodexResponseFailed;
+            return error.XaiGrokResponseFailed;
         }
     }
     if (cancel_flag.load(.seq_cst)) return error.Cancelled;
-    if (!terminal_seen) return error.OpenAICodexStreamIncomplete;
+    if (!terminal_seen) return error.XaiGrokStreamIncomplete;
 
     const owned_content = if (content.items.len > 0) try content.toOwnedSlice(alloc) else null;
     if (owned_content != null) content = .empty;
     errdefer if (owned_content) |value| alloc.free(value);
     const owned_provider_state = if (provider_state_count > 0) state: {
         try provider_state.writer.writeByte(']');
+        if (provider_state.written().len > max_provider_state_bytes) {
+            return error.XaiGrokResourceLimitExceeded;
+        }
         break :state try provider_state.toOwnedSlice();
     } else null;
     errdefer if (owned_provider_state) |value| alloc.free(value);
@@ -707,12 +740,11 @@ fn appendTool(
     output_index: i64,
     call_id: []const u8,
     name: []const u8,
-    limits: CodexLimits,
 ) !void {
-    if (tools.items.len >= limits.tool_calls or call_id.len == 0 or call_id.len > limits.tool_identity_bytes or
-        name.len == 0 or name.len > limits.tool_identity_bytes)
+    if (tools.items.len >= max_tool_calls or call_id.len == 0 or call_id.len > max_tool_identity_bytes or
+        name.len == 0 or name.len > max_tool_identity_bytes)
     {
-        return error.OpenAICodexToolCallLimitExceeded;
+        return error.XaiGrokToolCallLimitExceeded;
     }
     const id = try alloc.dupe(u8, call_id);
     errdefer alloc.free(id);
@@ -729,17 +761,16 @@ fn appendToolArguments(
     alloc: Allocator,
     arguments: *std.ArrayList(u8),
     delta: []const u8,
-    maximum: usize,
 ) !void {
-    _ = checkedAccumulatedSize(arguments.items.len, delta.len, maximum) catch
-        return error.OpenAICodexToolArgumentsTooLarge;
+    _ = checkedAccumulatedSize(arguments.items.len, delta.len, max_tool_arguments_bytes) catch
+        return error.XaiGrokToolArgumentsTooLarge;
     try arguments.appendSlice(alloc, delta);
 }
 
 fn checkedAccumulatedSize(current: usize, additional: usize, maximum: usize) !usize {
     const next = std.math.add(usize, current, additional) catch
-        return error.OpenAICodexResourceLimitExceeded;
-    if (next > maximum) return error.OpenAICodexResourceLimitExceeded;
+        return error.XaiGrokResourceLimitExceeded;
+    if (next > maximum) return error.XaiGrokResourceLimitExceeded;
     return next;
 }
 
@@ -805,7 +836,7 @@ fn unsignedField(object: std.json.ObjectMap, key: []const u8) ?u64 {
     return @intCast(value);
 }
 
-test "OpenAI Codex request uses Responses input and converts AI SDK tool schemas" {
+test "xAI Grok request uses Responses input and converts AI SDK tool schemas" {
     const messages = [_]types.ChatMessage{
         .{ .role = .system, .content = "Be concise." },
         .{ .role = .user, .content = "Read it." },
@@ -817,141 +848,29 @@ test "OpenAI Codex request uses Responses input and converts AI SDK tool schemas
         .{ .role = .tool, .tool_call_id = "call_1", .tool_name = "read_file", .content = "contents" },
     };
     const body = try agent_stream_provider.build(std.testing.allocator, .{
-        .model = "gpt-5.4",
+        .model = "grok-4.20",
         .serialized_tools = "[{\"type\":\"function\",\"name\":\"read_file\",\"description\":\"Read\",\"inputSchema\":{\"type\":\"object\"}}]",
         .messages = &messages,
         .tool_choice = .auto,
         .provider_options = .{ .reasoning = types.ReasoningEffort.literal("high"), .fast = true },
+        .max_output_tokens = 4096,
     });
     defer std.testing.allocator.free(body);
 
-    try std.testing.expect(std.mem.find(u8, body, "\"model\":\"gpt-5.4\"") != null);
+    try std.testing.expect(std.mem.find(u8, body, "\"model\":\"grok-4.20\"") != null);
     try std.testing.expect(std.mem.find(u8, body, "\"instructions\":\"Be concise.\"") != null);
     try std.testing.expect(std.mem.find(u8, body, "\"type\":\"function_call_output\"") != null);
     try std.testing.expect(std.mem.find(u8, body, "\"encrypted_content\":\"opaque\"") != null);
     try std.testing.expect(std.mem.find(u8, body, "\"parameters\":{\"type\":\"object\"}") != null);
     try std.testing.expect(std.mem.find(u8, body, "\"reasoning\":{\"effort\":\"high\"") != null);
-    try std.testing.expect(std.mem.find(u8, body, "\"service_tier\":\"priority\"") != null);
-    try std.testing.expect(std.mem.find(u8, body, "\"max_output_tokens\"") == null);
+    try std.testing.expect(std.mem.find(u8, body, "\"service_tier\"") == null);
+    try std.testing.expect(std.mem.find(u8, body, "\"max_output_tokens\":4096") != null);
 }
 
-fn makeSizedProviderState(alloc: Allocator, size: usize) ![]u8 {
-    const prefix = "[{\"type\":\"reasoning\",\"encrypted_content\":\"";
-    const suffix = "\"}]";
-    if (size < prefix.len + suffix.len) return error.TestProviderStateSizeTooSmall;
-    const state = try alloc.alloc(u8, size);
-    @memcpy(state[0..prefix.len], prefix);
-    @memset(state[prefix.len .. size - suffix.len], 'x');
-    @memcpy(state[size - suffix.len ..], suffix);
-    return state;
-}
-
-fn makeSizedToolArguments(alloc: Allocator, size: usize) ![]u8 {
-    const prefix = "{\"value\":\"";
-    const suffix = "\"}";
-    if (size < prefix.len + suffix.len) return error.TestToolArgumentsSizeTooSmall;
-    const arguments = try alloc.alloc(u8, size);
-    @memcpy(arguments[0..prefix.len], prefix);
-    @memset(arguments[prefix.len .. size - suffix.len], 'x');
-    @memcpy(arguments[size - suffix.len ..], suffix);
-    return arguments;
-}
-
-fn buildOpenAICodexReplay(messages: []const types.ChatMessage) ![]u8 {
-    return agent_stream_provider.build(std.testing.allocator, .{
-        .model = "gpt-5.6-sol",
-        .serialized_tools = "[]",
-        .messages = messages,
-        .tool_choice = .none,
-        .provider_options = .{},
-    });
-}
-
-fn expectOpenAICodexReplaySuccess(messages: []const types.ChatMessage) !void {
-    const body = try buildOpenAICodexReplay(messages);
-    std.testing.allocator.free(body);
-}
-
-fn expectOpenAICodexReplayError(expected: anyerror, messages: []const types.ChatMessage) !void {
-    const result = buildOpenAICodexReplay(messages);
-    if (result) |body| {
-        std.testing.allocator.free(body);
-        return error.TestExpectedOpenAICodexReplayError;
-    } else |err| {
-        try std.testing.expectEqual(expected, err);
-    }
-}
-
-test "OpenAI Codex replay provider state accepts the limit and rejects one byte beyond" {
-    {
-        const provider_state = try makeSizedProviderState(std.testing.allocator, max_provider_state_bytes);
-        defer std.testing.allocator.free(provider_state);
-        const messages = [_]types.ChatMessage{.{
-            .role = .assistant,
-            .provider_state_json = provider_state,
-        }};
-        try expectOpenAICodexReplaySuccess(&messages);
-    }
-    {
-        const provider_state = try makeSizedProviderState(std.testing.allocator, max_provider_state_bytes + 1);
-        defer std.testing.allocator.free(provider_state);
-        const messages = [_]types.ChatMessage{.{
-            .role = .assistant,
-            .provider_state_json = provider_state,
-        }};
-        try expectOpenAICodexReplayError(error.OpenAICodexProviderStateTooLarge, &messages);
-    }
-}
-
-test "OpenAI Codex replay tool count accepts the limit and rejects one call beyond" {
-    var calls: [max_tool_calls + 1]types.ToolCall = undefined;
-    for (&calls) |*call| call.* = .{ .id = "call", .name = "read_file", .arguments_json = "{}" };
-    var message: types.ChatMessage = .{ .role = .assistant, .tool_calls = calls[0..max_tool_calls] };
-    try expectOpenAICodexReplaySuccess(&.{message});
-    message.tool_calls = &calls;
-    try expectOpenAICodexReplayError(error.OpenAICodexToolCallLimitExceeded, &.{message});
-}
-
-test "OpenAI Codex replay tool identities accept the limit and reject one byte beyond" {
-    const identity = try std.testing.allocator.alloc(u8, max_tool_identity_bytes + 1);
-    defer std.testing.allocator.free(identity);
-    @memset(identity, 'i');
-    var call: types.ToolCall = .{ .id = identity[0..max_tool_identity_bytes], .name = "read", .arguments_json = "{}" };
-    var message: types.ChatMessage = .{ .role = .assistant, .tool_calls = &.{call} };
-    try expectOpenAICodexReplaySuccess(&.{message});
-    call.id = identity;
-    message.tool_calls = &.{call};
-    try expectOpenAICodexReplayError(error.OpenAICodexToolCallLimitExceeded, &.{message});
-
-    call = .{ .id = "call", .name = identity[0..max_tool_identity_bytes], .arguments_json = "{}" };
-    message.tool_calls = &.{call};
-    try expectOpenAICodexReplaySuccess(&.{message});
-    call.name = identity;
-    message.tool_calls = &.{call};
-    try expectOpenAICodexReplayError(error.OpenAICodexToolCallLimitExceeded, &.{message});
-}
-
-test "OpenAI Codex replay tool arguments accept the limit and reject one byte beyond" {
-    {
-        const arguments = try makeSizedToolArguments(std.testing.allocator, max_tool_arguments_bytes);
-        defer std.testing.allocator.free(arguments);
-        const calls = [_]types.ToolCall{.{ .id = "call", .name = "read", .arguments_json = arguments }};
-        const messages = [_]types.ChatMessage{.{ .role = .assistant, .tool_calls = &calls }};
-        try expectOpenAICodexReplaySuccess(&messages);
-    }
-    {
-        const arguments = try makeSizedToolArguments(std.testing.allocator, max_tool_arguments_bytes + 1);
-        defer std.testing.allocator.free(arguments);
-        const calls = [_]types.ToolCall{.{ .id = "call", .name = "read", .arguments_json = arguments }};
-        const messages = [_]types.ChatMessage{.{ .role = .assistant, .tool_calls = &calls }};
-        try expectOpenAICodexReplayError(error.OpenAICodexToolArgumentsTooLarge, &messages);
-    }
-}
-
-test "OpenAI Codex standard requests omit the priority service tier" {
+test "xAI Grok standard requests omit the priority service tier" {
     const messages = [_]types.ChatMessage{.{ .role = .user, .content = "Hello." }};
     const body = try agent_stream_provider.build(std.testing.allocator, .{
-        .model = "gpt-5.6-sol",
+        .model = "grok-4.20",
         .serialized_tools = "[]",
         .messages = &messages,
         .tool_choice = .none,
@@ -962,14 +881,14 @@ test "OpenAI Codex standard requests omit the priority service tier" {
     try std.testing.expect(std.mem.find(u8, body, "\"service_tier\"") == null);
 }
 
-test "OpenAI Codex serializes each verified image directly once" {
+test "xAI Grok serializes each verified image directly once" {
     const messages = [_]types.ChatMessage{.{ .role = .user, .content = "Describe it." }};
     const images = [_]image_attachments.VerifiedSnapshot{.{
         .bytes = @constCast(&[_]u8{ 1, 2, 3, 4 }),
         .media_type = "image/png",
     }};
     const body = try agent_stream_provider.build(std.testing.allocator, .{
-        .model = "gpt-5.6-sol",
+        .model = "grok-4.20",
         .serialized_tools = "[]",
         .messages = &messages,
         .tool_choice = .none,
@@ -984,18 +903,66 @@ test "OpenAI Codex serializes each verified image directly once" {
     try std.testing.expect(std.mem.find(u8, body, "data:image/png;base64,AQIDBA==") != null);
 }
 
-test "OpenAI Codex rejects a wrong-origin credential before network I/O" {
+test "xAI Grok rejects wrong-origin and invalid-account credentials before network I/O" {
     var cancelled = std.atomic.Value(bool).init(false);
     var delivery = stream_provider.DeliveryCertainty.init();
     var evidence: stream_provider.AttemptEvidence = .{};
     var callback_context: u8 = 0;
     try std.testing.expectError(
-        error.CodexSubscriptionCredentialRequired,
+        error.GrokSubscriptionCredentialRequired,
         agent_stream_provider.stream(std.testing.allocator, .{
             .api_key = "gateway-key",
             .credential_source = .ai_gateway_api_key,
             .team = null,
-            .model = "gpt-5.6-sol",
+            .model = "grok-4.20",
+            .retry_count = 1,
+            .chat_url = "",
+            .payload = "{}",
+            .trace_ctx = .{},
+            .content_capture_limit = null,
+            .delivery = &delivery,
+            .attempt_evidence = &evidence,
+            .callback_ctx = @ptrCast(&callback_context),
+            .on_content_chunk = struct {
+                fn ignore(_: *anyopaque, _: []const u8) void {}
+            }.ignore,
+            .on_tool_start = null,
+            .on_reasoning_chunk = null,
+            .cancel_flag = &cancelled,
+        }),
+    );
+    try std.testing.expectEqual(stream_provider.DeliveryCertainty.State.definitely_unsent, delivery.load());
+    try std.testing.expectError(
+        error.GrokSubscriptionAccountRequired,
+        agent_stream_provider.stream(std.testing.allocator, .{
+            .api_key = "grok-token",
+            .credential_source = .grok_subscription,
+            .team = null,
+            .model = "grok-4.20",
+            .retry_count = 1,
+            .chat_url = "",
+            .payload = "{}",
+            .trace_ctx = .{},
+            .content_capture_limit = null,
+            .delivery = &delivery,
+            .attempt_evidence = &evidence,
+            .callback_ctx = @ptrCast(&callback_context),
+            .on_content_chunk = struct {
+                fn ignore(_: *anyopaque, _: []const u8) void {}
+            }.ignore,
+            .on_tool_start = null,
+            .on_reasoning_chunk = null,
+            .cancel_flag = &cancelled,
+        }),
+    );
+    try std.testing.expectError(
+        error.InvalidGrokSubscriptionAccount,
+        agent_stream_provider.stream(std.testing.allocator, .{
+            .api_key = "grok-token",
+            .credential_source = .grok_subscription,
+            .account_id = "acct\r\ninjected",
+            .team = null,
+            .model = "grok-4.20",
             .retry_count = 1,
             .chat_url = "",
             .payload = "{}",
@@ -1015,7 +982,7 @@ test "OpenAI Codex rejects a wrong-origin credential before network I/O" {
     try std.testing.expectEqual(stream_provider.DeliveryCertainty.State.definitely_unsent, delivery.load());
 }
 
-test "OpenAI Codex SSE maps text reasoning tools and usage" {
+test "xAI Grok SSE maps text reasoning tools and usage" {
     const sse_text =
         "data: {\"type\":\"response.output_item.added\",\"output_index\":0,\"item\":{\"type\":\"reasoning\"}}\n\n" ++
         "data: {\"type\":\"response.reasoning_summary_text.delta\",\"output_index\":0,\"delta\":\"thinking\"}\n\n" ++
@@ -1058,7 +1025,6 @@ test "OpenAI Codex SSE maps text reasoning tools and usage" {
         null,
         &cancelled,
         null,
-        .{},
     );
     defer {
         if (completion.content) |value| std.testing.allocator.free(@constCast(value));
@@ -1077,147 +1043,452 @@ test "OpenAI Codex SSE maps text reasoning tools and usage" {
     try std.testing.expectEqual(types.ProviderFinishReason.tool_calls, completion.finish_reason.?);
 }
 
-fn consumeOpenAICodexTestSse(sse_text: []const u8, limits: CodexLimits) !types.GatewayCompletion {
-    var reader: std.Io.Reader = .fixed(sse_text);
+const TestResponseMode = enum {
+    slow_head,
+    stalled_sse,
+    error_body_exact,
+    error_body_excess,
+};
+
+const TestResponseFixture = struct {
+    io_backend: std.Io.Threaded = .init_single_threaded,
+    server: std.Io.net.Server,
+    mode: TestResponseMode,
+    thread: ?std.Thread = null,
+    server_open: bool = true,
+    stopping: std.atomic.Value(bool) = .init(false),
+    reached_stage: std.atomic.Value(bool) = .init(false),
+    failure: ?anyerror = null,
+
+    fn init(mode: TestResponseMode) !@This() {
+        var fixture: @This() = .{
+            .server = undefined,
+            .mode = mode,
+        };
+        var address = try std.Io.net.IpAddress.parse("127.0.0.1", 0);
+        fixture.server = try address.listen(fixture.io(), .{ .reuse_address = true });
+        return fixture;
+    }
+
+    fn start(self: *@This()) !void {
+        self.thread = try std.Thread.spawn(.{}, run, .{self});
+    }
+
+    fn deinit(self: *@This()) void {
+        if (!self.server_open) return;
+        self.stopping.store(true, .seq_cst);
+        const zio = self.io();
+        if (self.thread) |thread| {
+            const listener = std.Io.net.Stream{ .socket = self.server.socket };
+            listener.shutdown(zio, .both) catch {};
+            thread.join();
+            self.thread = null;
+        }
+        self.server.deinit(zio);
+        self.server_open = false;
+    }
+
+    fn io(self: *@This()) std.Io {
+        return self.io_backend.io();
+    }
+
+    fn port(self: *@This()) u16 {
+        return self.server.socket.address.getPort();
+    }
+
+    fn run(self: *@This()) void {
+        self.runFallible() catch |err| {
+            if (self.stopping.load(.seq_cst) and
+                (err == error.SocketNotListening or err == error.BrokenPipe or err == error.ConnectionResetByPeer))
+            {
+                return;
+            }
+            self.failure = err;
+        };
+    }
+
+    fn runFallible(self: *@This()) !void {
+        const zio = self.io();
+        var stream = try self.server.accept(zio);
+        defer stream.close(zio);
+        try readTestRequest(zio, stream);
+        switch (self.mode) {
+            .slow_head => {},
+            .stalled_sse => try writeTestBytes(
+                zio,
+                stream,
+                "HTTP/1.1 200 OK\r\n" ++
+                    "Content-Type: text/event-stream\r\n" ++
+                    "Connection: close\r\n\r\n" ++
+                    "data: {\"type\":\"response.output_text.delta\",\"delta\":\"partial\"}\n\n",
+            ),
+            .error_body_exact => {
+                try writeTestErrorResponse(zio, stream, max_error_body_bytes);
+                self.reached_stage.store(true, .seq_cst);
+                return;
+            },
+            .error_body_excess => {
+                try writeTestErrorResponse(zio, stream, max_error_body_bytes + 1);
+                self.reached_stage.store(true, .seq_cst);
+                return;
+            },
+        }
+        self.reached_stage.store(true, .seq_cst);
+        while (!self.stopping.load(.seq_cst)) {
+            var sleep_io: std.Io.Threaded = .init_single_threaded;
+            sleep_io.io().sleep(.fromMilliseconds(5), .real) catch {};
+        }
+    }
+};
+
+fn readTestRequest(zio: std.Io, stream: std.Io.net.Stream) !void {
+    var socket_buffer: [4096]u8 = undefined;
+    var reader = stream.reader(zio, &socket_buffer);
+    var request: [16 * 1024]u8 = undefined;
+    var header_len: usize = 0;
+    while (header_len < request.len) {
+        request[header_len] = try reader.interface.takeByte();
+        header_len += 1;
+        if (!std.mem.endsWith(u8, request[0..header_len], "\r\n\r\n")) continue;
+        const headers = request[0 .. header_len - 4];
+        var lines = std.mem.splitSequence(u8, headers, "\r\n");
+        while (lines.next()) |line| {
+            const prefix = "content-length:";
+            if (line.len < prefix.len or !std.ascii.eqlIgnoreCase(line[0..prefix.len], prefix)) continue;
+            const length = try std.fmt.parseInt(usize, std.mem.trim(u8, line[prefix.len..], " \t"), 10);
+            try reader.interface.discardAll(length);
+            return;
+        }
+        return;
+    }
+    return error.TestRequestTooLarge;
+}
+
+fn writeTestBytes(zio: std.Io, stream: std.Io.net.Stream, bytes: []const u8) !void {
+    var buffer: [4096]u8 = undefined;
+    var writer = stream.writer(zio, &buffer);
+    try writer.interface.writeAll(bytes);
+    try writer.interface.flush();
+}
+
+fn writeTestErrorResponse(zio: std.Io, stream: std.Io.net.Stream, body_bytes: usize) !void {
+    var buffer: [16 * 1024]u8 = undefined;
+    var writer = stream.writer(zio, &buffer);
+    try writer.interface.print(
+        "HTTP/1.1 429 Too Many Requests\r\nContent-Length: {d}\r\nConnection: close\r\n\r\n",
+        .{body_bytes},
+    );
+    try writer.interface.splatByteAll('e', body_bytes);
+    try writer.interface.flush();
+}
+
+var stable_xai_test_environ: ?*std.process.Environ.Map = null;
+
+fn stableXaiTestEnviron() !*const std.process.Environ.Map {
+    if (stable_xai_test_environ) |map| return map;
+    const alloc = std.heap.page_allocator;
+    const map = try alloc.create(std.process.Environ.Map);
+    map.* = std.process.Environ.Map.init(alloc);
+    stable_xai_test_environ = map;
+    return map;
+}
+
+const XaiTestEnvironment = struct {
+    alloc: Allocator,
+    map: std.process.Environ.Map,
+
+    fn install(alloc: Allocator, responses_url: []const u8) !*@This() {
+        _ = try stableXaiTestEnviron();
+        const self = try alloc.create(@This());
+        errdefer alloc.destroy(self);
+        self.* = .{
+            .alloc = alloc,
+            .map = std.process.Environ.Map.init(alloc),
+        };
+        errdefer self.map.deinit();
+        try self.map.put(e2e_endpoint_env, responses_url);
+        io_mod.setEnvironMap(&self.map);
+        return self;
+    }
+
+    fn deinit(self: *@This()) void {
+        if (stable_xai_test_environ) |map| io_mod.setEnvironMap(map);
+        self.map.deinit();
+        const alloc = self.alloc;
+        alloc.destroy(self);
+    }
+};
+
+fn runXaiTestStream(deadline: ?std.Io.Clock.Timestamp) !stream_provider.Result {
+    var delivery = stream_provider.DeliveryCertainty.init();
+    var evidence: stream_provider.AttemptEvidence = .{};
+    var cancelled = std.atomic.Value(bool).init(false);
+    var callback_context: u8 = 0;
+    return agent_stream_provider.stream(std.testing.allocator, .{
+        .api_key = "grok-test-token",
+        .credential_source = .grok_subscription,
+        .account_id = "acct_grok_test",
+        .team = null,
+        .model = "grok-4.20",
+        .retry_count = 1,
+        .chat_url = "",
+        .payload = "{}",
+        .trace_ctx = .{},
+        .content_capture_limit = 1024,
+        .deadline = deadline,
+        .delivery = &delivery,
+        .attempt_evidence = &evidence,
+        .callback_ctx = @ptrCast(&callback_context),
+        .on_content_chunk = ignoreTestChunk,
+        .on_tool_start = null,
+        .on_reasoning_chunk = null,
+        .cancel_flag = &cancelled,
+    });
+}
+
+test "xAI Grok request deadline closes slow headers and stalled SSE" {
+    inline for (.{ TestResponseMode.slow_head, TestResponseMode.stalled_sse }) |mode| {
+        var fixture = try TestResponseFixture.init(mode);
+        defer fixture.deinit();
+        try fixture.start();
+        const url = try std.fmt.allocPrint(
+            std.testing.allocator,
+            "http://127.0.0.1:{d}/responses",
+            .{fixture.port()},
+        );
+        defer std.testing.allocator.free(url);
+        const environment = try XaiTestEnvironment.install(std.testing.allocator, url);
+        defer environment.deinit();
+
+        const deadline = std.Io.Clock.Timestamp.fromNow(io_mod.getIo(), .{
+            .clock = .awake,
+            .raw = .fromMilliseconds(50),
+        });
+        const started = std.Io.Clock.Timestamp.now(io_mod.getIo(), .awake);
+        const result = runXaiTestStream(deadline);
+        const elapsed_ms = started.durationTo(std.Io.Clock.Timestamp.now(io_mod.getIo(), .awake)).raw.toMilliseconds();
+        fixture.deinit();
+
+        try std.testing.expectError(error.Timeout, result);
+        if (fixture.failure) |err| return err;
+        try std.testing.expect(fixture.reached_stage.load(.seq_cst));
+        try std.testing.expect(elapsed_ms < 1000);
+        try std.testing.expect(fixture.thread == null);
+    }
+}
+
+fn ignoreTestChunk(_: *anyopaque, _: []const u8) void {}
+
+test "xAI Grok error-body reader accepts the exact bound and replaces one beyond" {
+    inline for (.{ TestResponseMode.error_body_exact, TestResponseMode.error_body_excess }) |mode| {
+        var fixture = try TestResponseFixture.init(mode);
+        defer fixture.deinit();
+        try fixture.start();
+        const url = try std.fmt.allocPrint(
+            std.testing.allocator,
+            "http://127.0.0.1:{d}/responses",
+            .{fixture.port()},
+        );
+        defer std.testing.allocator.free(url);
+        const environment = try XaiTestEnvironment.install(std.testing.allocator, url);
+        defer environment.deinit();
+
+        var result = try runXaiTestStream(null);
+        defer result.deinit(std.testing.allocator);
+        fixture.deinit();
+        if (fixture.failure) |err| return err;
+        try std.testing.expectEqual(std.http.Status.too_many_requests, result.status);
+        if (mode == .error_body_exact) {
+            try std.testing.expectEqual(max_error_body_bytes, result.err_body.?.len);
+        } else {
+            try std.testing.expectEqualStrings(
+                "xAI Grok error response exceeded the local limit",
+                result.err_body.?,
+            );
+        }
+    }
+}
+
+fn deinitTestCompletion(completion: *types.GatewayCompletion) void {
+    if (completion.content) |value| std.testing.allocator.free(@constCast(value));
+    if (completion.generation_id) |value| std.testing.allocator.free(@constCast(value));
+    types.freeToolCallSlice(std.testing.allocator, @constCast(completion.tool_calls));
+    if (completion.provider_state_json) |value| std.testing.allocator.free(@constCast(value));
+    completion.* = .{};
+}
+
+fn consumeTestSse(bytes: []const u8) !types.GatewayCompletion {
+    var reader: std.Io.Reader = .fixed(bytes);
     var cancelled = std.atomic.Value(bool).init(false);
     var callback_context: u8 = 0;
     return consumeSse(
         std.testing.allocator,
         &reader,
         &callback_context,
-        struct {
-            fn ignore(_: *anyopaque, _: []const u8) void {}
-        }.ignore,
+        ignoreTestChunk,
         null,
         null,
         null,
         &cancelled,
         null,
-        limits,
     );
 }
 
-fn freeOpenAICodexTestCompletion(completion: types.GatewayCompletion) void {
-    if (completion.content) |value| std.testing.allocator.free(@constCast(value));
-    types.freeToolCallSlice(std.testing.allocator, @constCast(completion.tool_calls));
-    if (completion.generation_id) |value| std.testing.allocator.free(@constCast(value));
-    if (completion.provider_state_json) |value| std.testing.allocator.free(@constCast(value));
-}
-
-fn expectOpenAICodexSseError(expected: anyerror, sse_text: []const u8, limits: CodexLimits) !void {
-    const result = consumeOpenAICodexTestSse(sse_text, limits);
-    if (result) |completion| {
-        freeOpenAICodexTestCompletion(completion);
-        return error.TestExpectedOpenAICodexSseError;
-    } else |err| {
+fn expectTestSseError(expected: anyerror, bytes: []const u8) !void {
+    var completion = consumeTestSse(bytes) catch |err| {
         try std.testing.expectEqual(expected, err);
-    }
-}
-
-test "OpenAI Codex checked stream sizes accept the bound and reject overflow" {
-    try std.testing.expectEqual(@as(usize, 7), try checkedAccumulatedSize(6, 1, 7));
-    try std.testing.expectError(
-        error.OpenAICodexResourceLimitExceeded,
-        checkedAccumulatedSize(std.math.maxInt(usize), 1, std.math.maxInt(usize)),
-    );
-}
-
-test "OpenAI Codex rejects cumulative event and byte limits" {
-    const terminal_json = "{\"type\":\"response.completed\",\"response\":{\"status\":\"completed\"}}";
-    const terminal_event = "data: " ++ terminal_json ++ "\n\n";
-    const completion = try consumeOpenAICodexTestSse(
-        terminal_event,
-        .{ .events = 1, .aggregate_bytes = terminal_json.len },
-    );
-    defer freeOpenAICodexTestCompletion(completion);
-
-    const event = "data: {\"type\":\"response.reasoning_summary_part.done\"}\n\n";
-    try expectOpenAICodexSseError(
-        error.OpenAICodexResourceLimitExceeded,
-        event ++ event,
-        .{ .events = 1 },
-    );
-    try expectOpenAICodexSseError(
-        error.OpenAICodexResourceLimitExceeded,
-        terminal_event,
-        .{ .aggregate_bytes = terminal_json.len - 1 },
-    );
-}
-
-test "OpenAI Codex rejects oversized streamed tool identities" {
-    try expectOpenAICodexSseError(
-        error.OpenAICodexToolCallLimitExceeded,
-        "data: {\"type\":\"response.output_item.added\",\"output_index\":0,\"item\":{\"type\":\"function_call\",\"call_id\":\"call\",\"name\":\"ok\"}}\n\n",
-        .{ .tool_identity_bytes = 3 },
-    );
-    try expectOpenAICodexSseError(
-        error.OpenAICodexToolCallLimitExceeded,
-        "data: {\"type\":\"response.output_item.added\",\"output_index\":0,\"item\":{\"type\":\"function_call\",\"call_id\":\"ok\",\"name\":\"read\"}}\n\n",
-        .{ .tool_identity_bytes = 3 },
-    );
-}
-
-test "OpenAI Codex bounds every streamed argument representation and cleans staged state" {
-    const prefix =
-        "data: {\"type\":\"response.output_item.added\",\"output_index\":0,\"item\":{\"type\":\"function_call\",\"call_id\":\"c1\",\"name\":\"read\"}}\n\n" ++
-        "data: {\"type\":\"response.output_item.done\",\"output_index\":1,\"item\":{\"type\":\"reasoning\",\"encrypted_content\":\"opaque\"}}\n\n";
-    const cases = [_][]const u8{
-        prefix ++ "data: {\"type\":\"response.function_call_arguments.delta\",\"output_index\":0,\"delta\":\"four\"}\n\n",
-        prefix ++ "data: {\"type\":\"response.function_call_arguments.done\",\"output_index\":0,\"arguments\":\"four\"}\n\n",
-        prefix ++ "data: {\"type\":\"response.output_item.done\",\"output_index\":0,\"item\":{\"type\":\"function_call\",\"arguments\":\"four\"}}\n\n",
+        return;
     };
-    for (cases) |sse_text| {
-        try expectOpenAICodexSseError(
-            error.OpenAICodexToolArgumentsTooLarge,
-            sse_text,
-            .{ .tool_arguments_bytes = 3 },
-        );
+    defer deinitTestCompletion(&completion);
+    return error.TestExpectedResourceLimit;
+}
+
+fn buildEventCountSse(alloc: Allocator, event_count: usize) ![]u8 {
+    const terminal_json = "{\"type\":\"response.completed\",\"response\":{\"status\":\"completed\"}}";
+    var out: std.Io.Writer.Allocating = .init(alloc);
+    errdefer out.deinit();
+    for (1..event_count) |_| try out.writer.writeAll("data: {}\n\n");
+    try out.writer.writeAll("data: ");
+    try out.writer.writeAll(terminal_json);
+    try out.writer.writeAll("\n\n");
+    return out.toOwnedSlice();
+}
+
+fn buildIgnoredAggregateSse(alloc: Allocator, wire_bytes: usize) ![]u8 {
+    const mixed_ignored_and_data = ": keepalive\n\nretry: 1000\ndata: {}\n\n";
+    const terminal = "data: {\"type\":\"response.completed\",\"response\":{\"status\":\"completed\"}}\n";
+    if (wire_bytes < mixed_ignored_and_data.len + terminal.len) return error.NoSpaceLeft;
+    var out: std.Io.Writer.Allocating = .init(alloc);
+    errdefer out.deinit();
+    try out.writer.writeAll(mixed_ignored_and_data);
+    var remaining = wire_bytes - mixed_ignored_and_data.len - terminal.len;
+    while (remaining > 0) {
+        const line_wire_bytes = @min(remaining, max_sse_line_bytes + 1);
+        if (line_wire_bytes > 1) {
+            try out.writer.writeByte(':');
+            try out.writer.splatByteAll('a', line_wire_bytes - 2);
+        }
+        try out.writer.writeByte('\n');
+        remaining -= line_wire_bytes;
+    }
+    try out.writer.writeAll(terminal);
+    return out.toOwnedSlice();
+}
+
+fn buildToolArgumentsSse(alloc: Allocator, argument_bytes: usize) ![]u8 {
+    const chunk_count: usize = 8;
+    const delta_prefix = "data: {\"type\":\"response.function_call_arguments.delta\",\"output_index\":0,\"delta\":\"";
+    const delta_suffix = "\"}\n\n";
+    const terminal = "data: {\"type\":\"response.completed\",\"response\":{\"status\":\"completed\"}}\n\n";
+    var out: std.Io.Writer.Allocating = .init(alloc);
+    errdefer out.deinit();
+    try out.writer.writeAll(
+        "data: {\"type\":\"response.output_item.added\",\"output_index\":0," ++
+            "\"item\":{\"type\":\"function_call\",\"call_id\":\"call_1\",\"name\":\"terminal\"}}\n\n",
+    );
+    const bytes_per_chunk = argument_bytes / chunk_count;
+    var remainder = argument_bytes % chunk_count;
+    for (0..chunk_count) |_| {
+        const extra: usize = if (remainder > 0) 1 else 0;
+        remainder -|= extra;
+        try out.writer.writeAll(delta_prefix);
+        try out.writer.splatByteAll('a', bytes_per_chunk + extra);
+        try out.writer.writeAll(delta_suffix);
+    }
+    try out.writer.writeAll(terminal);
+    return out.toOwnedSlice();
+}
+
+fn buildProviderStateSse(alloc: Allocator, provider_state_bytes: usize) ![]u8 {
+    const item_count: usize = 8;
+    const event_prefix = "data: {\"type\":\"response.output_item.done\",\"output_index\":0,\"item\":";
+    const item_prefix = "{\"id\":\"rs\",\"type\":\"reasoning\",\"encrypted_content\":\"";
+    const item_suffix = "\"}";
+    const event_suffix = "}\n\n";
+    const terminal = "data: {\"type\":\"response.completed\",\"response\":{\"status\":\"completed\"}}\n\n";
+    const framing_bytes = 2 + (item_count - 1) + item_count * (item_prefix.len + item_suffix.len);
+    const content_bytes = provider_state_bytes - framing_bytes;
+    const bytes_per_item = content_bytes / item_count;
+    var remainder = content_bytes % item_count;
+
+    var out: std.Io.Writer.Allocating = .init(alloc);
+    errdefer out.deinit();
+    for (0..item_count) |_| {
+        const extra: usize = if (remainder > 0) 1 else 0;
+        remainder -|= extra;
+        try out.writer.writeAll(event_prefix);
+        try out.writer.writeAll(item_prefix);
+        try out.writer.splatByteAll('a', bytes_per_item + extra);
+        try out.writer.writeAll(item_suffix);
+        try out.writer.writeAll(event_suffix);
+    }
+    try out.writer.writeAll(terminal);
+    return out.toOwnedSlice();
+}
+
+test "xAI Grok SSE reader accepts the exact line bound and rejects one beyond" {
+    inline for (.{ max_sse_line_bytes, max_sse_line_bytes + 1 }) |line_bytes| {
+        const bytes = try std.testing.allocator.alloc(u8, line_bytes + 1);
+        defer std.testing.allocator.free(bytes);
+        @memcpy(bytes[0.."data: ".len], "data: ");
+        @memset(bytes["data: ".len..line_bytes], 'a');
+        bytes[line_bytes] = '\n';
+        var reader: std.Io.Reader = .fixed(bytes);
+        var sse: SseReader = .{};
+        defer sse.deinit(std.testing.allocator);
+        if (line_bytes == max_sse_line_bytes) {
+            const value = (try sse.next(std.testing.allocator, &reader)).?;
+            try std.testing.expectEqual(max_sse_line_bytes - "data: ".len, value.len);
+        } else {
+            try std.testing.expectError(
+                error.XaiGrokSseEventTooLarge,
+                sse.next(std.testing.allocator, &reader),
+            );
+        }
     }
 }
 
-test "OpenAI Codex rejects oversized encrypted provider state" {
-    try expectOpenAICodexSseError(
-        error.OpenAICodexResourceLimitExceeded,
-        "data: {\"type\":\"response.output_item.done\",\"output_index\":0,\"item\":{\"type\":\"reasoning\",\"encrypted_content\":\"opaque\"}}\n\n",
-        .{ .provider_state_bytes = 16 },
-    );
+test "xAI Grok SSE reducer enforces event and ignored-wire aggregate bounds" {
+    const exact_events = try buildEventCountSse(std.testing.allocator, max_sse_events);
+    defer std.testing.allocator.free(exact_events);
+    var exact_event_completion = try consumeTestSse(exact_events);
+    deinitTestCompletion(&exact_event_completion);
+
+    const excess_events = try buildEventCountSse(std.testing.allocator, max_sse_events + 1);
+    defer std.testing.allocator.free(excess_events);
+    try expectTestSseError(error.XaiGrokResourceLimitExceeded, excess_events);
+
+    const exact_aggregate = try buildIgnoredAggregateSse(std.testing.allocator, max_sse_aggregate_bytes);
+    defer std.testing.allocator.free(exact_aggregate);
+    try std.testing.expectEqual(max_sse_aggregate_bytes, exact_aggregate.len);
+    var exact_aggregate_completion = try consumeTestSse(exact_aggregate);
+    deinitTestCompletion(&exact_aggregate_completion);
+
+    const excess_aggregate = try buildIgnoredAggregateSse(std.testing.allocator, max_sse_aggregate_bytes + 1);
+    defer std.testing.allocator.free(excess_aggregate);
+    try std.testing.expectEqual(max_sse_aggregate_bytes + 1, excess_aggregate.len);
+    try expectTestSseError(error.XaiGrokResourceLimitExceeded, excess_aggregate);
 }
 
-test "OpenAI Codex provider state accepts the exact framed limit" {
-    const expected_state = "[{\"type\":\"reasoning\",\"encrypted_content\":\"a\"},{\"type\":\"reasoning\",\"encrypted_content\":\"b\"}]";
-    const sse_text =
-        "data: {\"type\":\"response.output_item.done\",\"output_index\":0,\"item\":{\"type\":\"reasoning\",\"encrypted_content\":\"a\"}}\n\n" ++
-        "data: {\"type\":\"response.output_item.done\",\"output_index\":1,\"item\":{\"type\":\"reasoning\",\"encrypted_content\":\"b\"}}\n\n" ++
-        "data: {\"type\":\"response.completed\",\"response\":{\"status\":\"completed\"}}\n\n";
-    const completion = try consumeOpenAICodexTestSse(
-        sse_text,
-        .{ .provider_state_bytes = expected_state.len },
-    );
-    defer freeOpenAICodexTestCompletion(completion);
-    try std.testing.expectEqualStrings(expected_state, completion.provider_state_json.?);
-    try expectOpenAICodexSseError(
-        error.OpenAICodexResourceLimitExceeded,
-        sse_text,
-        .{ .provider_state_bytes = expected_state.len - 1 },
-    );
-}
+test "xAI Grok SSE reducer cleans up bounded tool arguments and provider state" {
+    const exact_arguments = try buildToolArgumentsSse(std.testing.allocator, max_tool_arguments_bytes);
+    defer std.testing.allocator.free(exact_arguments);
+    var argument_completion = try consumeTestSse(exact_arguments);
+    defer deinitTestCompletion(&argument_completion);
+    try std.testing.expectEqual(@as(usize, 1), argument_completion.tool_calls.len);
+    try std.testing.expectEqual(max_tool_arguments_bytes, argument_completion.tool_calls[0].arguments_json.len);
 
-test "OpenAI Codex rejects a 129th streamed tool call" {
-    var stream: std.Io.Writer.Allocating = .init(std.testing.allocator);
-    defer stream.deinit();
-    for (0..129) |index| {
-        try stream.writer.print(
-            "data: {{\"type\":\"response.output_item.added\",\"output_index\":{d},\"item\":{{\"type\":\"function_call\",\"call_id\":\"call_{d}\",\"name\":\"read_file\"}}}}\n\n",
-            .{ index, index },
-        );
-    }
-    try stream.writer.writeAll("data: {\"type\":\"response.completed\",\"response\":{\"status\":\"completed\"}}\n\n");
+    const excess_arguments = try buildToolArgumentsSse(std.testing.allocator, max_tool_arguments_bytes + 1);
+    defer std.testing.allocator.free(excess_arguments);
+    try expectTestSseError(error.XaiGrokToolArgumentsTooLarge, excess_arguments);
 
-    const result = consumeOpenAICodexTestSse(stream.written(), .{});
-    if (result) |completion| {
-        freeOpenAICodexTestCompletion(completion);
-        return error.TestExpectedToolCallLimit;
-    } else |err| {
-        try std.testing.expectEqual(error.OpenAICodexToolCallLimitExceeded, err);
-    }
+    const exact_state = try buildProviderStateSse(std.testing.allocator, max_provider_state_bytes);
+    defer std.testing.allocator.free(exact_state);
+    var state_completion = try consumeTestSse(exact_state);
+    defer deinitTestCompletion(&state_completion);
+    try std.testing.expectEqual(max_provider_state_bytes, state_completion.provider_state_json.?.len);
+
+    const excess_state = try buildProviderStateSse(std.testing.allocator, max_provider_state_bytes + 1);
+    defer std.testing.allocator.free(excess_state);
+    try expectTestSseError(error.XaiGrokResourceLimitExceeded, excess_state);
 }

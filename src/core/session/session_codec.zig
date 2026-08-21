@@ -515,6 +515,13 @@ fn isCapturedCommandToolCall(alloc: Allocator, call: types.ToolCall) !bool {
 }
 
 pub fn validateState(state: DurableSessionState) !void {
+    return validateStateWithPermissionMigration(state, false);
+}
+
+fn validateStateWithPermissionMigration(
+    state: DurableSessionState,
+    allow_legacy_permission_state: bool,
+) !void {
     try validateSessionId(state.id);
     try validateWorkspaceRoot(state.origin_workspace_root);
     try validateWorkspaceRoot(state.workspace_root);
@@ -531,8 +538,13 @@ pub fn validateState(state: DurableSessionState) !void {
         }
     }
     if (state.usage) |usage| try session_usage.validateSnapshot(usage);
-    session_permission_state.validate(state.permission_state) catch
-        return error.InvalidDurableField;
+    if (allow_legacy_permission_state and state.permission_state.version == 1) {
+        session_permission_state.validateSchema(state.permission_state, 1) catch
+            return error.InvalidDurableField;
+    } else {
+        session_permission_state.validate(state.permission_state) catch
+            return error.InvalidDurableField;
+    }
     if (state.recovery_checkpoint) |checkpoint| {
         if (checkpoint.version != 1 or
             checkpoint.turn_id == 0 or
@@ -697,7 +709,7 @@ fn parsePermissionState(
             .generation = try requireU64(rule_object, "generation"),
         });
     }
-    session_permission_state.validate(state) catch
+    session_permission_state.validateSchema(state, version) catch
         return error.InvalidDurableField;
     return state;
 }
@@ -895,7 +907,7 @@ fn decodeStateImpl(alloc: Allocator, source: *std.Io.Reader, limits: DecodeLimit
         .usage = usage,
         .recovery_checkpoint = recovery_checkpoint,
     };
-    try validateState(state);
+    try validateStateWithPermissionMigration(state, true);
     return state;
 }
 
@@ -3399,6 +3411,46 @@ test "recovery checkpoint rejects an outstanding attempt beyond its budget" {
         },
     };
     try std.testing.expectError(error.InvalidDurableField, validateState(invalid));
+}
+
+test "permission state schema two round trips before activation" {
+    const alloc = std.testing.allocator;
+    var state: session_permission_state.State = .{
+        .version = session_permission_state.schema_version,
+        .next_generation = 2,
+    };
+    defer state.deinit(alloc);
+    const key = try session_permission_state.commandKeyV2(
+        alloc,
+        "git status",
+        "/workspace",
+        "foreground",
+        "macos",
+    );
+    try state.rules.append(alloc, .{
+        .id = .{ .value = 1 },
+        .key = key,
+        .display_identity = try alloc.dupe(u8, "git status"),
+        .decision = .deny,
+        .generation = 1,
+    });
+
+    var encoded: std.Io.Writer.Allocating = .init(alloc);
+    defer encoded.deinit();
+    try writePermissionState(&encoded.writer, state);
+    var json = try std.json.parseFromSlice(
+        std.json.Value,
+        alloc,
+        encoded.written(),
+        .{},
+    );
+    defer json.deinit();
+    var decoded = try parsePermissionState(alloc, json.value);
+    defer decoded.deinit(alloc);
+
+    try std.testing.expectEqual(session_permission_state.schema_version, decoded.version);
+    try std.testing.expectEqual(@as(usize, 1), decoded.rules.items.len);
+    try std.testing.expectEqual(session_permission_state.StateDecision.deny, session_permission_state.decide(decoded, key));
 }
 
 test "durable session optional fields handle fuzzed ownership paths" {

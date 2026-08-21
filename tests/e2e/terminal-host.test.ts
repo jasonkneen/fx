@@ -1114,17 +1114,16 @@ function ownerCatalogAuthorityForSession(
     durable_session_id: principal.durable_session_id,
     workspace_root: principal.workspace_root,
     transport_role: principal.transport_role,
-    sandbox_backend: principal.sandbox_backend,
   };
   const proof = { bytes: Array(32).fill(11) };
   const claim = { principal: ownerPrincipal, actor, proof };
   const key = ownerCatalogDigest(
-    "fx.terminal.owner-catalog-key.v1\0",
+    "fx.terminal.owner-catalog-key.v2\0",
     ownerPrincipal,
     actor,
   ).toString("hex");
   const verifier = ownerCatalogDigest(
-    "fx.terminal.owner-catalog-proof.v1\0",
+    "fx.terminal.owner-catalog-proof.v2\0",
     ownerPrincipal,
     actor,
     Buffer.from(proof.bytes),
@@ -1146,7 +1145,7 @@ function ownerCatalogAuthorityForSession(
   writeFileSync(
     join(state, `catalog-authority-${key}.json`),
     JSON.stringify({
-      schema_version: 1,
+      schema_version: 2,
       principal: ownerPrincipal,
       actor,
       verifier: [...verifier],
@@ -1167,7 +1166,6 @@ function ownerCatalogDigest(
   if (proof) hash.update(proof);
   hash.update(actor);
   hash.update(principal.transport_role);
-  hash.update(principal.sandbox_backend);
   for (const value of [
     principal.profile_user,
     principal.durable_session_id,
@@ -1233,7 +1231,6 @@ function withPersistence(value: Record<string, unknown>): Record<string, unknown
           workspace_root: cwd,
           cwd,
           transport_role: "interactive",
-          sandbox_backend: "none",
           backend,
           lifetime: "session",
         },
@@ -3333,7 +3330,7 @@ test.skipIf(!tmuxAvailable())("transient tmux recovery failures preserve the pan
   }
 }, 180_000);
 
-test.skipIf(!tmuxAvailable())("tmux recovery restores the saved execution scope", async () => {
+test.skipIf(!tmuxAvailable())("tmux recovery restores the saved workspace scope", async () => {
   if (!existsSync("/bin/zsh")) return;
   const home = makeHome();
   const workspace = join(home, "workspace");
@@ -3378,9 +3375,6 @@ test.skipIf(!tmuxAvailable())("tmux recovery restores the saved execution scope"
     grant: { principal: Record<string, unknown> };
   };
   persistence.grant.principal.workspace_root = workspace;
-  persistence.grant.principal.sandbox_backend = process.platform === "darwin"
-    ? "macos"
-    : "none";
 
   const firstHost = startHost(home, undefined, 30_000);
   const firstStdout = streamText(firstHost.stdout);
@@ -3495,15 +3489,20 @@ test.skipIf(!tmuxAvailable())("tmux recovery restores the saved execution scope"
   };
   expect(before.monitors).toEqual(initialMonitors.map((_, index) => ({
     monitor_id: `monitor-${index + 1}`,
-    state: "active",
+    state: process.platform === "darwin" && index === 1 ? "matched" : "active",
   })));
-  expect(before.events).toEqual([]);
+  if (process.platform === "darwin") {
+    expect(before.events).toHaveLength(1);
+    expect(before.events[0]).toMatchObject({ monitor_id: "monitor-2" });
+  } else {
+    expect(before.events).toEqual([]);
+  }
   expect(JSON.stringify(before)).not.toContain("proof");
-  let preRecoverySandboxChecks = 0;
+  let preRecoveryProbeChecks = 0;
   if (process.platform === "darwin") {
     await waitFor(() => monitorRuntimes()[1]!.check_count > 0);
-    preRecoverySandboxChecks = monitorRuntimes()[1]!.check_count;
-    expect(existsSync(outsideWrite)).toBe(false);
+    preRecoveryProbeChecks = monitorRuntimes()[1]!.check_count;
+    expect(existsSync(outsideWrite)).toBe(true);
   }
 
   const oldIdentity = readFileSync(paths.identity, "utf8");
@@ -3558,13 +3557,18 @@ test.skipIf(!tmuxAvailable())("tmux recovery restores the saved execution scope"
     "inspect",
   ) as typeof before;
   expect(recoveredInspect.monitors).toEqual(before.monitors);
-  expect(recoveredInspect.events).toEqual([]);
+  if (process.platform === "darwin") {
+    expect(recoveredInspect.events).toHaveLength(1);
+    expect(recoveredInspect.events[0]).toMatchObject({ monitor_id: "monitor-2" });
+  } else {
+    expect(recoveredInspect.events).toEqual([]);
+  }
   expect(JSON.stringify(recoveredInspect)).not.toContain("proof");
   if (process.platform === "darwin") {
     await waitFor(() =>
-      monitorRuntimes()[1]!.check_count > preRecoverySandboxChecks
+      monitorRuntimes()[1]!.check_count > preRecoveryProbeChecks
     );
-    expect(existsSync(outsideWrite)).toBe(false);
+    expect(existsSync(outsideWrite)).toBe(true);
   }
 
   writeFileSync(scopeMarker, "ready");
@@ -4292,9 +4296,6 @@ test("durable authority survives reconnect and rejects every foreign scope", asy
     }),
     authorityVariant(sessionId, {
       principal: { ...current.principal, transport_role: "acp" },
-    }),
-    authorityVariant(sessionId, {
-      principal: { ...current.principal, sandbox_backend: "macos" },
     }),
     authorityVariant(sessionId, {
       principal: { ...current.principal, backend: "tmux" },

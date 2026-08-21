@@ -42,7 +42,6 @@ pub const Runtime = struct {
     settings_menu: settings_catalog.Menu = .{},
     appearance_menu: settings_catalog.AppearanceMenu = .{},
     statusline_menu: settings_catalog.StatuslineMenu = .{},
-    sandbox_menu: settings_catalog.SandboxMenu = .{},
     usage_menu: usage_menu.State = .{},
     workspace_menu: workspace_menu.State = .{},
     composer_history: composer_history.State = .{},

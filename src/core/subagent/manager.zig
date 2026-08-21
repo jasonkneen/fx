@@ -7747,7 +7747,6 @@ test "live authority resolver refreshes deny rules before the next child action"
             return .{
                 .generation = self.generation,
                 .tools = tools,
-                .sandbox_backend = .macos,
                 .integrations = integrations,
                 .rules = .{ .rules = rules },
                 .grants = try output_alloc.alloc(types.PermissionGrant, 0),
@@ -7788,7 +7787,6 @@ test "live authority resolver refreshes deny rules before the next child action"
     var first = try resolver.resolve(alloc, "child-id");
     defer first.deinit(alloc);
     try std.testing.expectEqual(types.PermissionMode.auto, first.permission_mode);
-    try std.testing.expectEqual(types.BackendKind.macos, first.sandbox_backend);
     try std.testing.expectEqualStrings("run_command", first.tools[0]);
     try std.testing.expectEqualStrings("mcp:test", first.integrations[0]);
     try std.testing.expectEqual(

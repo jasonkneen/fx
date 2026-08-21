@@ -164,26 +164,6 @@ pub fn statuslineMenuProjection(
     };
 }
 
-pub const SandboxMenuProjection = struct {
-    active: bool = false,
-    selected_index: usize = 0,
-    snapshot: settings_catalog.Snapshot = .{},
-    os_sandbox_available: bool = true,
-};
-
-pub fn sandboxMenuProjection(
-    menu: *const settings_catalog.SandboxMenu,
-    snapshot: settings_catalog.Snapshot,
-    os_sandbox_available: bool,
-) SandboxMenuProjection {
-    return .{
-        .active = menu.active,
-        .selected_index = menu.selected_index,
-        .snapshot = snapshot,
-        .os_sandbox_available = os_sandbox_available,
-    };
-}
-
 pub const UsageMenuProjection = struct {
     active: bool = false,
     scope: usage_report.Scope = .days_30,
@@ -232,7 +212,6 @@ pub fn workspaceMenuProjection(
 
 pub const CompactCommandMenuProjection = union(enum) {
     statusline: StatuslineMenuProjection,
-    sandbox: SandboxMenuProjection,
     usage: UsageMenuProjection,
     workspace: WorkspaceMenuProjection,
 };
@@ -362,7 +341,6 @@ pub const RenderContext = struct {
     session_menu: SessionMenuProjection = .{},
     appearance_menu: AppearanceMenuProjection = .{},
     statusline_menu: StatuslineMenuProjection = .{},
-    sandbox_menu: SandboxMenuProjection = .{},
     usage_menu: UsageMenuProjection = .{},
     workspace_menu: WorkspaceMenuProjection = .{},
     upgrade_status: []const u8 = "",
@@ -378,7 +356,6 @@ pub const RenderContext = struct {
 
 pub fn activeCompactCommandMenu(ctx: RenderContext) ?CompactCommandMenuProjection {
     if (ctx.statusline_menu.active) return .{ .statusline = ctx.statusline_menu };
-    if (ctx.sandbox_menu.active) return .{ .sandbox = ctx.sandbox_menu };
     if (ctx.usage_menu.active) return .{ .usage = ctx.usage_menu };
     if (ctx.workspace_menu.active) return .{ .workspace = ctx.workspace_menu };
     return null;

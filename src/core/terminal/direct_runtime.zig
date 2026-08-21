@@ -25,7 +25,6 @@ pub const Admission = struct {
     profile_user: []const u8,
     durable_session_id: []const u8,
     workspace_root: []const u8,
-    sandbox_backend: @FieldType(contracts.Principal, "sandbox_backend"),
     command: []const u8,
 };
 
@@ -155,7 +154,6 @@ pub const Runtime = struct {
             .workspace_root = input.workspace_root,
             .cwd = input.workspace_root,
             .transport_role = .interactive,
-            .sandbox_backend = input.sandbox_backend,
             .backend = .native,
             .actor = .human,
             .controls = .full(),

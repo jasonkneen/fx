@@ -6,6 +6,7 @@ const image_attachments = @import("../images/image_attachments.zig");
 const io_mod = @import("../shared/io.zig");
 const profile_paths = @import("../shared/profile_paths.zig");
 const core_types = @import("../shared/types.zig");
+const session_permission_state = @import("../permissions/session_permission_state.zig");
 const artifact_digest = @import("artifact_digest.zig");
 const command_replay_store = @import("command_replay_store.zig");
 const result_store = @import("result_store.zig");
@@ -1084,6 +1085,17 @@ pub const Store = struct {
     ) !LoadedWritableSession {
         var loaded = loaded_value;
         errdefer loaded.deinit(alloc);
+        const needs_permission_migration =
+            loaded.state.permission_state.version !=
+            session_permission_state.schema_version;
+        if (needs_permission_migration) {
+            const migrated_permission_state = try session_permission_state.migrateV1ToV2(
+                alloc,
+                loaded.state.permission_state,
+            );
+            loaded.state.permission_state.deinit(alloc);
+            loaded.state.permission_state = migrated_permission_state;
+        }
         var migration_state = try loaded.state.dupe(alloc);
         defer migration_state.deinit(alloc);
         const session_dir = try sessionDirPath(
@@ -1094,11 +1106,13 @@ pub const Store = struct {
         defer alloc.free(session_dir);
         const snapshot_dir = try std.fs.path.join(alloc, &.{ session_dir, "images" });
         defer alloc.free(snapshot_dir);
-        const needs_migration_commit = try session.repair_legacy_images_transactionally(
+        const needs_image_migration = try session.repair_legacy_images_transactionally(
             alloc,
             migration_state.history,
             snapshot_dir,
         );
+        const needs_migration_commit = needs_permission_migration or
+            needs_image_migration;
         if (needs_migration_commit) {
             var migration_committed = false;
             errdefer if (!migration_committed) {
@@ -5077,6 +5091,43 @@ fn writeSessionFixture(alloc: Allocator, store: Store, id: []const u8, text: []c
     const path = try sessionJsonPath(alloc, store.sessions_dir, id);
     try writeRawFile(path, text);
     return path;
+}
+
+test "resume commits legacy permission state migration before publication" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var ctx = try initTempStore(alloc, &tmp);
+    defer ctx.deinit(alloc);
+
+    var state = try testDurableState(alloc, "permission-migration", ctx.workspace);
+    defer state.deinit(alloc);
+    var started = try ctx.store.startWritableSession(alloc, state);
+    started.log.park();
+    started.deinit(alloc);
+
+    var legacy = try ctx.store.resumeExactForWrite(
+        alloc,
+        "permission-migration",
+        ctx.workspace,
+        true,
+        .{},
+    );
+    legacy.state.permission_state.version = 1;
+    var migrated = try ctx.store.finishResumedForWrite(alloc, legacy, .{});
+    try std.testing.expectEqual(
+        session_permission_state.schema_version,
+        migrated.state.permission_state.version,
+    );
+    migrated.log.park();
+    migrated.deinit(alloc);
+
+    var resumed = try ctx.store.resumeForWrite(alloc, "permission-migration");
+    defer resumed.deinit(alloc);
+    try std.testing.expectEqual(
+        session_permission_state.schema_version,
+        resumed.state.permission_state.version,
+    );
 }
 
 fn chmodPath(alloc: Allocator, path: []const u8, mode: std.c.mode_t) !void {

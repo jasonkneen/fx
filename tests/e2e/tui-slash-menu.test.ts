@@ -220,18 +220,6 @@ async function waitForStatuslineMenu(
   throw new Error(`Timed out waiting for status line menu.\nPane:\n${latest.join("\n")}`);
 }
 
-async function waitForSandboxMenu(session: TmuxSession): Promise<string[]> {
-  const deadline = Date.now() + TIMEOUT;
-  let latest: string[] = [];
-  while (Date.now() < deadline) {
-    latest = await session.capturePaneGrid();
-    const pane = latest.join("\n");
-    if (pane.includes("Sandbox") && pane.includes("←→ Change")) return latest;
-    await Bun.sleep(100);
-  }
-  throw new Error(`Timed out waiting for sandbox menu.\nPane:\n${latest.join("\n")}`);
-}
-
 async function waitForUsageMenu(session: TmuxSession): Promise<string[]> {
   const deadline = Date.now() + TIMEOUT;
   let latest: string[] = [];
@@ -968,7 +956,7 @@ describe.skipIf(SKIP)("tui: slash menu", () => {
       ).toBe(71);
       expect(closedComposerRow).toBe(73);
       await session.sendLiteralText("/");
-      await session.waitForText("Commands 40", 5_000);
+      await session.waitForText("Commands 38", 5_000);
       const afterSlash = await capture("after-slash");
       expect(visibleTranscriptTailRow(afterSlash)).toBe(62);
       expect(composerRow(afterSlash)).toBe(64);
@@ -1208,7 +1196,7 @@ describe.skipIf(SKIP)("tui: slash menu", () => {
       let grid = await waitForSettingsMenu(session);
       expect(grid.join("\n")).toContain("Slash menu categories");
 
-      for (let index = 0; index < 6; index += 1) {
+      for (let index = 0; index < 5; index += 1) {
         await session.sendKeys("Down");
       }
       await session.sendKeys("Left");
@@ -1412,9 +1400,9 @@ describe.skipIf(SKIP)("tui: slash menu", () => {
         (current) => hasEmptyComposer(current) && current.includes("𝒇x") && !current.includes("Sessions"),
         5_000,
       );
-      await session.sendLiteralText("/sandbox ");
+      await session.sendLiteralText("/maxxing ");
       pane = await session.waitForPane(
-        (current) => current.includes("os") && current.includes("none"),
+        (current) => current.includes("minimal") && current.includes("legacy"),
         5_000,
       );
       expect(pane).not.toContain("resume-helper");
@@ -1467,7 +1455,7 @@ describe.skipIf(SKIP)("tui: slash menu", () => {
       await session.waitForComposer(10_000);
 
       await session.sendText("/help");
-      let grid = await waitForHelpMenu(session, 40);
+      let grid = await waitForHelpMenu(session, 38);
       let pane = grid.join("\n");
       expect(pane).not.toContain("𝒇x");
       expect(pane).not.toContain("Run /help for commands");
@@ -1487,11 +1475,11 @@ describe.skipIf(SKIP)("tui: slash menu", () => {
       expect(pane).not.toContain("/clear");
 
       await session.sendKeys("C-u");
-      await waitForHelpMenu(session, 40);
+      await waitForHelpMenu(session, 38);
       await session.sendKeys("Down");
       await session.sendKeys("Enter");
       pane = await session.waitForPane(
-        (current) => hasEmptyComposer(current) && !current.includes("Commands 40"),
+        (current) => hasEmptyComposer(current) && !current.includes("Commands 38"),
         5_000,
       );
       expect(composerContains(pane, "/clear")).toBe(false);
@@ -1500,7 +1488,7 @@ describe.skipIf(SKIP)("tui: slash menu", () => {
 
       await session.sendKeys("C-u");
       await session.sendText("/help");
-      await waitForHelpMenu(session, 40);
+      await waitForHelpMenu(session, 38);
       await session.sendLiteralText("additional directories");
       await waitForHelpMenu(session, 1);
       await session.sendKeys("Enter");
@@ -1517,7 +1505,7 @@ describe.skipIf(SKIP)("tui: slash menu", () => {
 
       await session.sendKeys("C-u");
       await session.sendText("/help");
-      await waitForHelpMenu(session, 40);
+      await waitForHelpMenu(session, 38);
       await session.sendLiteralText("no command can match this query");
       await session.waitForText("No commands found.", 5_000);
       await session.sendKeys("Escape");
@@ -1589,7 +1577,7 @@ describe.skipIf(SKIP)("tui: slash menu", () => {
       await session.sendKeys("Left");
       await waitForSettingValue(settingsPath, "maxxing_mode", "legacy");
 
-      for (let index = 0; index < 4; index += 1) await session.sendKeys("Down");
+      for (let index = 0; index < 3; index += 1) await session.sendKeys("Down");
       await session.waitForText(/Status line workspace\s+off/, 5_000);
       await session.sendKeys("Right");
       await waitForStatuslineValue(settingsPath, "workspace", true);
@@ -1715,7 +1703,7 @@ describe.skipIf(SKIP)("tui: slash menu", () => {
       await session.waitForComposer(10_000);
 
       await session.sendText("/help");
-      let pane = await session.waitForText("Commands 40", 5_000);
+      let pane = await session.waitForText("Commands 38", 5_000);
       expect(pane).toContain("/help");
       expect(pane).not.toContain("● /help");
       await session.sendKeys("Escape");
@@ -1789,7 +1777,7 @@ describe.skipIf(SKIP)("tui: slash menu", () => {
       await session.sendText("/statusline");
       let grid = await waitForStatuslineMenu(session);
       let pane = grid.join("\n");
-      expect(pane).toContain("Sandbox");
+      expect(pane).not.toContain("Sandbox");
       expect(pane).toContain("Context");
       expect(pane).toContain("Workspace");
       expect(pane).toContain("off  on");
@@ -1801,7 +1789,7 @@ describe.skipIf(SKIP)("tui: slash menu", () => {
       await session.sendKeys("Right");
       grid = await waitForStatuslineMenu(session, "off  on");
       pane = grid.join("\n");
-      expect(JSON.parse(readFileSync(settingsPath, "utf8")).statusLine.sandbox).toBe(true);
+      expect(JSON.parse(readFileSync(settingsPath, "utf8")).statusLine.context).toBe(true);
 
       await session.sendKeys("Down");
       await session.sendKeys("Right");
@@ -1809,9 +1797,8 @@ describe.skipIf(SKIP)("tui: slash menu", () => {
       pane = grid.join("\n");
       expect(pane).not.toContain("saved to user settings");
       expect(pane).not.toContain("● Statusline:");
-      expect(JSON.parse(readFileSync(settingsPath, "utf8")).statusLine.context).toBe(true);
+      expect(JSON.parse(readFileSync(settingsPath, "utf8")).statusLine.session).toBe(true);
 
-      await session.sendKeys("Down");
       await session.sendKeys("Down");
       await session.sendKeys("Right");
       grid = await waitForStatuslineMenu(session, "Workspace");
@@ -1837,69 +1824,6 @@ describe.skipIf(SKIP)("tui: slash menu", () => {
         (current) => hasEmptyComposer(current) && !current.includes("compact-statusline-workspace"),
         5_000,
       );
-
-      await session.sendText("/quit");
-      expect(await session.waitForSessionEnd(TIMEOUT)).toBe(true);
-      session = null;
-    },
-    TEST_TIMEOUT,
-  );
-
-  test(
-    "sandbox command applies a mode from a compact inline panel",
-    async () => {
-      const root = realpathSync(mkdtempSync(join(tmpdir(), "fx-sandbox-menu-")));
-      workDirs.push(root);
-      const home = join(root, "home");
-      const workspace = join(root, "workspace");
-      const settingsPath = join(home, ".fx", "settings.json");
-      mkdirSync(join(home, ".fx"), { recursive: true });
-      mkdirSync(workspace, { recursive: true });
-      writeFileSync(settingsPath, `${JSON.stringify({ sandbox: "none" })}\n`);
-
-      session = await TmuxSession.create({
-        cwd: workspace,
-        env: {
-          HOME: home,
-          AI_GATEWAY_API_KEY: undefined,
-          VERCEL_OIDC_TOKEN: undefined,
-          FX_AUTO_UPGRADE: "0",
-        },
-        width: 100,
-        height: 30,
-      });
-      await session.waitForComposer(10_000);
-
-      await session.sendText("/sandbox");
-      let grid = await waitForSandboxMenu(session);
-      let pane = grid.join("\n");
-      expect(pane).toContain("Command sandbox");
-      expect(pane).toContain("Choose command process isolation");
-      expect(pane).toContain("os  none");
-      expect(pane).not.toContain("✓");
-      expect(pane).not.toContain("❯");
-      expect(pane).not.toContain("Choose one");
-      expect(pane).toContain("←→ Change");
-
-      await session.sendKeys("Down");
-      await session.sendKeys("Right");
-      grid = await waitForSandboxMenu(session);
-      pane = grid.join("\n");
-      expect(pane).toContain("Command sandbox");
-      expect(pane).toContain("os  none");
-      expect(pane).not.toContain("✓");
-      expect(pane).not.toContain("❯");
-      expect(JSON.parse(readFileSync(settingsPath, "utf8")).sandbox).toBe("none");
-
-      await session.sendKeys("Escape");
-      await session.waitForPane(
-        (current) =>
-          hasEmptyComposer(current) &&
-          current.includes("𝒇x") &&
-          !current.includes("←→ Change"),
-        5_000,
-      );
-      expect(session.isAlive()).toBe(true);
 
       await session.sendText("/quit");
       expect(await session.waitForSessionEnd(TIMEOUT)).toBe(true);
@@ -3463,7 +3387,7 @@ describe.skipIf(SKIP)("tui: slash menu", () => {
       await session.waitForComposer(10_000);
 
       await session.sendLiteralText("/");
-      await session.waitForText("Commands 40", 5_000);
+      await session.waitForText("Commands 38", 5_000);
 
       for (let i = 0; i < 5; i += 1) {
         await session.sendKeys("Down");

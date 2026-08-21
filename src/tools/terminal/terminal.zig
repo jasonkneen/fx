@@ -752,7 +752,6 @@ fn buildRequest(
             .workspace_root = ctx.workspace_root,
             .cwd = cwd,
             .transport_role = ctx.terminal_transport_role,
-            .sandbox_backend = ctx.sandbox_backend,
             .backend = input.backend orelse .native,
             .actor = .agent,
             .controls = .full(),
@@ -776,7 +775,6 @@ fn buildRequest(
                 .durable_session_id = durable_session_id,
                 .workspace_root = ctx.workspace_root,
                 .transport_role = ctx.terminal_transport_role,
-                .sandbox_backend = ctx.sandbox_backend,
                 .actor = .agent,
             },
         );
@@ -801,7 +799,6 @@ fn buildRequest(
         .durable_session_id = durable_session_id,
         .workspace_root = ctx.workspace_root,
         .transport_role = ctx.terminal_transport_role,
-        .sandbox_backend = ctx.sandbox_backend,
         .actor = .agent,
     });
     errdefer authority.deinit();
@@ -1229,10 +1226,15 @@ pub fn mapAuthorizedResult(
         .success => return result,
         .failure => |failure| failure.code,
     };
-    if (code != .path_outside_workspace) return result;
-
     var mapped = result;
-    mapped.status_detail = try alloc.dupe(u8, "path is outside the workspace");
+    mapped.status_detail = switch (code) {
+        .path_outside_workspace => try alloc.dupe(u8, "path is outside the workspace"),
+        .authority_retired => try alloc.dupe(
+            u8,
+            "saved terminal authority is from an older fx version; start a new terminal",
+        ),
+        else => return result,
+    };
     return mapped;
 }
 
@@ -1265,6 +1267,7 @@ fn mapErrorCode(err: anyerror) contracts.StructuredErrorCode {
         error.InvalidHolderProof,
         error.ControlDenied,
         => .authority_denied,
+        error.TerminalAuthorityRetired => .authority_retired,
         error.Cancelled => .cancelled,
         else => .invalid_request,
     };
@@ -2135,7 +2138,7 @@ test "registered terminal validation enforces action-specific input before execu
     }
 }
 
-test "terminal result mapper adds detail only for workspace path failures" {
+test "terminal result mapper adds detail for actionable failures" {
     const alloc = std.testing.allocator;
     const cases = [_]struct {
         status: tool_dispatch.DispatchResult.Status,
@@ -2151,6 +2154,11 @@ test "terminal result mapper adds detail only for workspace path failures" {
             .status = .failure,
             .body = "{\"failure\":{\"action\":\"start\",\"code\":\"invalid_request\",\"session_id\":null,\"retryable\":false}}",
             .expected_detail = null,
+        },
+        .{
+            .status = .failure,
+            .body = "{\"failure\":{\"action\":\"read\",\"code\":\"authority_retired\",\"session_id\":\"terminal-old\",\"retryable\":false}}",
+            .expected_detail = "saved terminal authority is from an older fx version; start a new terminal",
         },
         .{ .status = .failure, .body = "not json", .expected_detail = null },
         .{

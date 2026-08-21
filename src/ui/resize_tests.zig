@@ -5494,7 +5494,6 @@ test "compact picker dismissal preserves committed history floor" {
                 "auth=AI_GATEWAY_API_KEY\n" ++
                 "auth_refreshable=false\n" ++
                 "permission_mode=auto\n" ++
-                "sandbox=none\n" ++
                 "workspace=/tmp/fx\n" ++
                 "history_turns=0\n" ++
                 "session_permission_grants=0\n" ++
@@ -5754,7 +5753,7 @@ test "slash main page renders header categories selection range and contextual c
     try renderTestFooter(&h, &input, &approval, &h.frame_redraw);
     try h.flush();
 
-    try expectGridContains(&h, "Commands 40 · Type to filter");
+    try expectGridContains(&h, "Commands 38 · Type to filter");
     try expectGridContains(&h, "1–6");
     try expectGridContains(&h, "/help");
     try expectGridContains(&h, "General");
@@ -5775,7 +5774,7 @@ test "slash main page renders header categories selection range and contextual c
 
     try expectGridContains(&h, "ask");
     try expectGridContains(&h, "test-model");
-    try expectGridNotContains(&h, "Commands 40");
+    try expectGridNotContains(&h, "Commands 38");
     try expectGridNotContains(&h, "↑↓ Navigate");
 }
 

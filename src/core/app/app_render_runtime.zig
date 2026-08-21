@@ -20,7 +20,6 @@ const diff_mod = @import("../output/diff.zig");
 const io_mod = @import("../shared/io.zig");
 const text_utils = @import("../shared/text_utils.zig");
 const permission_request = @import("../permissions/permission_request.zig");
-const sandbox = @import("../permissions/sandbox.zig");
 const skill_runtime = @import("../skills/skill_runtime.zig");
 const types = @import("../shared/types.zig");
 const subagent_domain = @import("../subagent/domain.zig");
@@ -588,11 +587,6 @@ pub fn Runtime(comptime App: type) type {
                     &app.input_runtime.statusline_menu,
                     settings_snapshot,
                 ),
-                .sandbox_menu = render_input.sandboxMenuProjection(
-                    &app.input_runtime.sandbox_menu,
-                    settings_snapshot,
-                    sandbox.osSandboxAvailable(),
-                ),
                 .usage_menu = render_input.usageMenuProjection(
                     &app.input_runtime.usage_menu,
                 ),
@@ -1125,7 +1119,6 @@ pub fn Runtime(comptime App: type) type {
             ctx.session_menu = .{};
             ctx.appearance_menu = .{};
             ctx.statusline_menu = .{};
-            ctx.sandbox_menu = .{};
             ctx.usage_menu = .{};
             ctx.workspace_menu = .{};
             ctx.upgrade_status = "";
@@ -1136,7 +1129,6 @@ pub fn Runtime(comptime App: type) type {
             ctx.statusline = .{
                 .workspace_label = base.statusline.workspace_label,
                 .git_branch = base.statusline.git_branch,
-                .sandbox_label = base.statusline.sandbox_label,
             };
             const worker_status_projection = if (app.subagents.childConversationRuntime()) |child_runtime|
                 child_runtime.worker_status_state().projection()
@@ -1231,16 +1223,6 @@ pub fn Runtime(comptime App: type) type {
                 ) catch app.workspace_identity.snapshot();
                 items.workspace_label = identity.workspace_label;
                 items.git_branch = identity.git_branch;
-            }
-            if (app.statusline_sandbox) {
-                const permission_mode: types.PermissionMode = if (comptime @hasField(App, "permission_engine"))
-                    app.permission_engine.mode
-                else
-                    .auto;
-                items.sandbox_label = sandbox.publicModeForBackend(sandbox.effectiveBackend(
-                    permission_mode,
-                    app.permission_state.sandbox_backend,
-                )).label();
             }
             if (app.statusline_context) {
                 items.context_used = app.total_input_tokens;
@@ -4545,7 +4527,6 @@ const CoordinatorTestApp = struct {
     stream: types.StreamState = .{},
     fast_mode: bool = false,
     effort: types.ReasoningEffort = .auto,
-    statusline_sandbox: bool = false,
     statusline_context: bool = false,
     total_input_tokens: u64 = 0,
     gateway_metadata_model: ?[]const u8 = null,

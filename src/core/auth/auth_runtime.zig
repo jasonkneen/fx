@@ -2,6 +2,7 @@ const std = @import("std");
 const api_key_validator = @import("api_key_validator.zig");
 const credentials = @import("credentials.zig");
 const chatgpt_oauth = @import("chatgpt_oauth.zig");
+const grok_oauth = @import("grok_oauth.zig");
 const host = @import("../hosts/host.zig");
 const host_target = @import("../hosts/target.zig");
 const login_flow = @import("login_flow.zig");
@@ -27,6 +28,7 @@ const credential_source_order = [_]credentials.Source{
     .fx_login,
     .stored_key,
     .chatgpt_subscription,
+    .grok_subscription,
 };
 
 const SourceProbeFn = *const fn (?*anyopaque, Allocator, credentials.Source) anyerror!bool;
@@ -128,6 +130,10 @@ pub fn refreshCredentialTokenForAccount(
             .if_needed => (try credentials.loadSource(alloc, transport, host.unavailable_secret_store, source)) orelse return null,
             .force => (try credentials.refreshChatGptCredential(alloc, transport)) orelse return null,
         },
+        .grok_subscription => switch (mode) {
+            .if_needed => (try credentials.loadSource(alloc, transport, host.unavailable_secret_store, source)) orelse return null,
+            .force => (try credentials.refreshGrokCredential(alloc, transport)) orelse return null,
+        },
         else => unreachable,
     };
     defer credential.deinit(alloc);
@@ -144,9 +150,11 @@ pub fn refreshCredentialTokenForAccount(
 pub const AcquisitionAction = enum {
     login,
     chatgpt_login,
+    grok_login,
     setup,
     change_team,
     switch_credential,
+    switch_provider,
     /// Clears a remembered choice so resolution returns to plain precedence.
     /// Without it the only way back would be editing settings.json by hand.
     automatic,
@@ -379,12 +387,12 @@ pub const PickerView = struct {
     pub fn choiceCount(self: PickerView) usize {
         return switch (self.stage) {
             .root => if (self.include_skip)
-                if (comptime host_target.is_wasm) 2 else 3
+                if (comptime host_target.is_wasm) 2 else 4
             else if (comptime host_target.is_wasm)
                 4
             else
-                5,
-            .provider => 2,
+                7,
+            .provider => if (comptime host_target.is_wasm) 2 else 3,
             .sign_in, .api_key => 0,
             .change_team => blk: {
                 var count: usize = 0;
@@ -409,7 +417,8 @@ pub const PickerView = struct {
                 else switch (index) {
                     0 => .{ .action = .login },
                     1 => .{ .action = .chatgpt_login },
-                    2 => .{ .action = .setup },
+                    2 => .{ .action = .grok_login },
+                    3 => .{ .action = .setup },
                     else => null,
                 }
             else if (comptime host_target.is_wasm)
@@ -423,14 +432,17 @@ pub const PickerView = struct {
             else switch (index) {
                 0 => .{ .action = .login },
                 1 => .{ .action = .chatgpt_login },
-                2 => .{ .action = .setup },
-                3 => .{ .action = .change_team },
-                4 => .{ .action = .switch_credential },
+                2 => .{ .action = .grok_login },
+                3 => .{ .action = .setup },
+                4 => .{ .action = .switch_provider },
+                5 => .{ .action = .change_team },
+                6 => .{ .action = .switch_credential },
                 else => null,
             },
             .provider => switch (index) {
                 0 => .{ .provider = .gateway },
                 1 => .{ .provider = .codex },
+                2 => if (comptime host_target.is_wasm) null else .{ .provider = .grok },
                 else => null,
             },
             .sign_in, .api_key => null,
@@ -473,9 +485,11 @@ pub const PickerView = struct {
             .action => |action| switch (action) {
                 .login => "Sign in with Vercel",
                 .chatgpt_login => "Sign in with Codex",
+                .grok_login => "Sign in with Grok",
                 .setup => if (self.include_skip) "Add an API key" else "API key",
                 .change_team => "Change team",
                 .switch_credential => "Switch credential",
+                .switch_provider => "Switch provider",
                 .automatic => "Automatic",
             },
             .team => |index| if (index < self.teams.len) self.teams[index].name else "",
@@ -489,7 +503,8 @@ pub const PickerView = struct {
             .action => |action| switch (action) {
                 .login => if (self.fx_login_session_available) "connected" else "",
                 .chatgpt_login => if (self.available_sources.contains(.chatgpt_subscription)) "connected" else "",
-                .setup, .switch_credential => "",
+                .grok_login => if (self.available_sources.contains(.grok_subscription)) "connected" else "",
+                .setup, .switch_credential, .switch_provider => "",
                 .automatic => "use normal precedence",
                 .change_team => if (self.fx_login_session_available) "choose a team" else "sign in first",
             },
@@ -500,7 +515,8 @@ pub const PickerView = struct {
     pub fn choiceEnabled(self: PickerView, choice: Choice) bool {
         return switch (choice) {
             .action => |action| (action != .change_team or self.fx_login_session_available) and
-                (action != .chatgpt_login or !host_target.is_wasm),
+                (action != .chatgpt_login or !host_target.is_wasm) and
+                (action != .grok_login or !host_target.is_wasm),
             .provider, .source, .team => true,
         };
     }
@@ -545,6 +561,7 @@ pub const StatusSnapshot = struct {
     stored_key_status: credentials.StoredKeyReadStatus = .not_attempted,
     gateway_connected: bool = false,
     chatgpt_connected: bool = false,
+    grok_connected: bool = false,
     /// The active credential is past its refresh deadline. Distinct from `refreshable`,
     /// which answers whether this source type can refresh at all.
     expired: bool = false,
@@ -570,6 +587,12 @@ pub const StatusSnapshot = struct {
             return switch (surface) {
                 .cli => credentials.missing_chatgpt_credential_message,
                 .interactive => credentials.missing_chatgpt_interactive_credential_message,
+            };
+        }
+        if (self.required_source == .grok_subscription) {
+            return switch (surface) {
+                .cli => credentials.missing_grok_credential_message,
+                .interactive => credentials.missing_grok_interactive_credential_message,
             };
         }
         return switch (surface) {
@@ -615,6 +638,14 @@ pub fn loadStatusSnapshotForProvider(
         error.OutOfMemory => return err,
         else => false,
     };
+    const grok_connected = credentials.sourceExists(
+        alloc,
+        secret_store,
+        .grok_subscription,
+    ) catch |err| switch (err) {
+        error.OutOfMemory => return err,
+        else => false,
+    };
     // Resolves in `.stored` mode: a diagnostic must not refresh, because refreshing
     // rewrites the session file and performs network I/O. It reports the expired state
     // instead of repairing it.
@@ -643,9 +674,9 @@ pub fn loadStatusSnapshotForProvider(
         },
     };
     const resolved_source = if (resolution.credential) |credential| credential.source else null;
-    var gateway_connected = resolved_source != null and resolved_source != .chatgpt_subscription;
-    const gateway_probe_required = provider == .codex or
-        resolved_source == .chatgpt_subscription;
+    var gateway_connected = resolved_source != null and resolved_source != .chatgpt_subscription and resolved_source != .grok_subscription;
+    const gateway_probe_required = provider == .codex or provider == .grok or
+        resolved_source == .chatgpt_subscription or resolved_source == .grok_subscription;
     if (gateway_probe_required) {
         for ([_]credentials.Source{ .vercel_oidc_token, .ai_gateway_api_key, .fx_login, .stored_key }) |source| {
             if (credentials.sourceExists(alloc, secret_store, source) catch |err| switch (err) {
@@ -669,14 +700,21 @@ pub fn loadStatusSnapshotForProvider(
             .stored_key_status = resolution.stored_key_status,
             .gateway_connected = gateway_connected,
             .chatgpt_connected = chatgpt_connected,
+            .grok_connected = grok_connected,
             .expired = expired,
         };
     }
     return .{
-        .required_source = if (provider == .codex) .chatgpt_subscription else null,
+        .required_source = if (provider == .codex)
+            .chatgpt_subscription
+        else if (provider == .grok)
+            .grok_subscription
+        else
+            null,
         .stored_key_status = resolution.stored_key_status,
         .gateway_connected = gateway_connected,
         .chatgpt_connected = chatgpt_connected,
+        .grok_connected = grok_connected,
     };
 }
 
@@ -826,15 +864,18 @@ pub const Runtime = struct {
             self.source_inventory.contains(.fx_login) or
             self.source_inventory.contains(.stored_key);
         const chatgpt_connected = self.source_inventory.contains(.chatgpt_subscription);
+        const grok_connected = self.source_inventory.contains(.grok_subscription);
         const credential = self.selected_credential orelse return .{
             .gateway_connected = gateway_connected,
             .chatgpt_connected = chatgpt_connected,
+            .grok_connected = grok_connected,
         };
         return .{
             .active_source = credential.source,
             .team = displayTeam(credential),
             .gateway_connected = gateway_connected,
             .chatgpt_connected = chatgpt_connected,
+            .grok_connected = grok_connected,
             .expired = credential.needsRefreshAt(now_ms),
         };
     }
@@ -876,6 +917,14 @@ pub const Runtime = struct {
             self.source_inventory.insert(.chatgpt_subscription);
         } else if (self.credentialSource() != .chatgpt_subscription) {
             self.source_inventory.remove(.chatgpt_subscription);
+        }
+    }
+
+    pub fn refreshGrokSourceInventory(self: *Self, alloc: Allocator) !void {
+        if (try credentials.sourceExists(alloc, self.secret_store, .grok_subscription)) {
+            self.source_inventory.insert(.grok_subscription);
+        } else if (self.credentialSource() != .grok_subscription) {
+            self.source_inventory.remove(.grok_subscription);
         }
     }
 
@@ -1004,7 +1053,7 @@ pub const Runtime = struct {
         self.picker_stage = .switch_credential;
         const active_source = self.credentialSource();
         self.picker_selection = if (active_source) |source|
-            if (source != .chatgpt_subscription and self.source_inventory.contains(source))
+            if (source != .chatgpt_subscription and source != .grok_subscription and self.source_inventory.contains(source))
                 .{ .source = source }
             else
                 self.pickerView().choiceAt(0)
@@ -1048,6 +1097,16 @@ pub const Runtime = struct {
         return self.openSignInPickerWithParent(alloc, false, .chatgpt_subscription);
     }
 
+    pub fn openGrokSignInPickerFromRoot(self: *Self, alloc: Allocator) !bool {
+        if (comptime host_target.is_wasm) return error.GrokOAuthUnavailable;
+        return self.openSignInPickerWithParent(alloc, true, .grok_subscription);
+    }
+
+    pub fn openGrokSignInPickerForProviderSwitch(self: *Self, alloc: Allocator) !bool {
+        if (comptime host_target.is_wasm) return error.GrokOAuthUnavailable;
+        return self.openSignInPickerWithParent(alloc, false, .grok_subscription);
+    }
+
     fn openSignInPickerWithParent(
         self: *Self,
         alloc: Allocator,
@@ -1058,6 +1117,7 @@ pub const Runtime = struct {
         const started = switch (source) {
             .fx_login => try self.sign_in_flow.start(alloc, self.oauth_transport),
             .chatgpt_subscription => try chatgpt_oauth.startSignIn(&self.sign_in_flow, alloc, self.oauth_transport),
+            .grok_subscription => try grok_oauth.startSignIn(&self.sign_in_flow, alloc, self.oauth_transport),
             else => return error.InvalidSignInSource,
         };
         if (!started) return false;
@@ -1171,7 +1231,8 @@ pub const Runtime = struct {
             return true;
         }
         if (stage == .provider) {
-            self.closePicker(alloc);
+            self.picker_stage = .root;
+            self.picker_selection = .{ .action = .switch_provider };
             return true;
         }
 
@@ -1203,7 +1264,12 @@ pub const Runtime = struct {
         self.picker_selection = .{ .action = switch (stage) {
             .root => unreachable,
             .provider => unreachable,
-            .sign_in => if (self.sign_in_source == .chatgpt_subscription) .chatgpt_login else .login,
+            .sign_in => if (self.sign_in_source == .chatgpt_subscription)
+                .chatgpt_login
+            else if (self.sign_in_source == .grok_subscription)
+                .grok_login
+            else
+                .login,
             .api_key => .setup,
             .change_team => .change_team,
             .switch_credential => .switch_credential,
@@ -1237,6 +1303,7 @@ pub const Runtime = struct {
                 .source => self.closePicker(alloc),
                 .action => |action| switch (action) {
                     .change_team => {},
+                    .switch_provider => {},
                     .switch_credential => {
                         self.openSwitchCredentialPicker(alloc);
                         return null;
@@ -1244,7 +1311,7 @@ pub const Runtime = struct {
                     .setup => {},
                     // Only reachable from the switch screen, never the root.
                     .automatic => unreachable,
-                    .login, .chatgpt_login => self.closePicker(alloc),
+                    .login, .chatgpt_login, .grok_login => self.closePicker(alloc),
                 },
                 .team => unreachable,
             },
@@ -1346,7 +1413,16 @@ pub const Runtime = struct {
                     self,
                     loadRuntimeCredentialSource,
                 ),
-            .gateway => if (self.credentialSource() != .chatgpt_subscription)
+            .grok => if (self.credentialSource() == .grok_subscription)
+                false
+            else
+                self.selectSourceWithLoader(
+                    alloc,
+                    .grok_subscription,
+                    self,
+                    loadRuntimeCredentialSource,
+                ),
+            .gateway => if (self.credentialSource() != .chatgpt_subscription and self.credentialSource() != .grok_subscription)
                 false
             else
                 @as(?bool, try self.reselectByPrecedenceWithDeps(
@@ -1391,7 +1467,7 @@ pub const Runtime = struct {
 
         try self.refreshSourceInventoryWithProbe(alloc, ctx, probe);
         for (credential_source_order) |source| {
-            if (source == .chatgpt_subscription) continue;
+            if (source == .chatgpt_subscription or source == .grok_subscription) continue;
             if (!self.source_inventory.contains(source)) continue;
             if (try self.selectSourceWithLoader(alloc, source, ctx, loader) != null) {
                 return self.credentialSource() != previous;
@@ -1405,6 +1481,18 @@ pub const Runtime = struct {
     pub fn reconcileAfterChatGptLogout(self: *Self, alloc: Allocator) !bool {
         const was_available = self.source_inventory.contains(.chatgpt_subscription);
         const was_active = self.credentialSource() == .chatgpt_subscription;
+        if (was_active) {
+            if (self.selected_credential) |*credential| credential.deinit(alloc);
+            self.selected_credential = null;
+            self.credential_refresh_failure_source = null;
+        }
+        try self.refreshSourceInventory(alloc);
+        return was_active or was_available;
+    }
+
+    pub fn reconcileAfterGrokLogout(self: *Self, alloc: Allocator) !bool {
+        const was_available = self.source_inventory.contains(.grok_subscription);
+        const was_active = self.credentialSource() == .grok_subscription;
         if (was_active) {
             if (self.selected_credential) |*credential| credential.deinit(alloc);
             self.selected_credential = null;
@@ -1441,7 +1529,7 @@ pub const Runtime = struct {
         if (!login_was_active) return false;
 
         for (credential_source_order) |source| {
-            if (source == .chatgpt_subscription) continue;
+            if (source == .chatgpt_subscription or source == .grok_subscription) continue;
             if (!self.source_inventory.contains(source)) continue;
             if (try self.selectSourceWithLoader(alloc, source, ctx, loader) != null) return true;
             self.source_inventory.remove(source);
@@ -1537,7 +1625,7 @@ fn takeDisplayTeam(alloc: Allocator, credential: *credentials.Credential) ?[]u8 
 fn gatewaySourceCount(sources: SourceSet) usize {
     var count: usize = 0;
     for (credential_source_order) |source| {
-        if (source == .chatgpt_subscription or !sources.contains(source)) continue;
+        if (source == .chatgpt_subscription or source == .grok_subscription or !sources.contains(source)) continue;
         count += 1;
     }
     return count;
@@ -1546,7 +1634,7 @@ fn gatewaySourceCount(sources: SourceSet) usize {
 fn gatewaySourceAtIndex(sources: SourceSet, wanted_index: usize) ?credentials.Source {
     var index: usize = 0;
     for (credential_source_order) |source| {
-        if (source == .chatgpt_subscription or !sources.contains(source)) continue;
+        if (source == .chatgpt_subscription or source == .grok_subscription or !sources.contains(source)) continue;
         if (index == wanted_index) return source;
         index += 1;
     }
@@ -2206,15 +2294,16 @@ test "auth picker root starts on sign in and keeps sources in the switch stage" 
     const picker = runtime.pickerView();
     try std.testing.expect(picker.active);
     try std.testing.expect((Choice{ .action = .login }).eql(picker.selected_choice.?));
-    try std.testing.expectEqual(@as(usize, 5), picker.choiceCount());
-    try std.testing.expect(picker.choiceAt(5) == null);
+    try std.testing.expectEqual(@as(usize, 7), picker.choiceCount());
+    try std.testing.expectEqualStrings("Switch provider", picker.choiceLabel(picker.choiceAt(4).?));
+    try std.testing.expect(picker.choiceAt(7) == null);
 }
 
-test "credential switcher excludes provider-routed ChatGPT sessions" {
+test "credential switcher excludes provider-routed subscription sessions" {
     const alloc = std.testing.allocator;
     var runtime: Runtime = .{};
     defer runtime.deinit(alloc);
-    runtime.source_inventory = SourceSet.initMany(&.{ .ai_gateway_api_key, .chatgpt_subscription });
+    runtime.source_inventory = SourceSet.initMany(&.{ .ai_gateway_api_key, .chatgpt_subscription, .grok_subscription });
     runtime.openPicker(alloc);
     runtime.openSwitchCredentialPicker(alloc);
 
@@ -2224,7 +2313,7 @@ test "credential switcher excludes provider-routed ChatGPT sessions" {
     try std.testing.expect((Choice{ .action = .automatic }).eql(picker.choiceAt(1).?));
 }
 
-test "auth picker navigation wraps across the five hub actions" {
+test "auth picker navigation wraps across the seven hub actions" {
     const alloc = std.testing.allocator;
     var runtime: Runtime = .{};
     runtime.source_inventory = SourceSet.initMany(&.{ .ai_gateway_api_key, .fx_login });
@@ -2233,7 +2322,11 @@ test "auth picker navigation wraps across the five hub actions" {
     try std.testing.expect(runtime.movePicker(1));
     try std.testing.expect((Choice{ .action = .chatgpt_login }).eql(runtime.pickerView().selected_choice.?));
     try std.testing.expect(runtime.movePicker(1));
+    try std.testing.expect((Choice{ .action = .grok_login }).eql(runtime.pickerView().selected_choice.?));
+    try std.testing.expect(runtime.movePicker(1));
     try std.testing.expect((Choice{ .action = .setup }).eql(runtime.pickerView().selected_choice.?));
+    try std.testing.expect(runtime.movePicker(1));
+    try std.testing.expectEqualStrings("Switch provider", runtime.pickerView().choiceLabel(runtime.pickerView().selected_choice.?));
     try std.testing.expect(runtime.movePicker(1));
     try std.testing.expect((Choice{ .action = .change_team }).eql(runtime.pickerView().selected_choice.?));
     try std.testing.expect(runtime.movePicker(1));
@@ -2265,7 +2358,7 @@ test "auth picker without credentials exposes acquisition actions" {
     try std.testing.expect(picker.active_source == null);
     try std.testing.expect((Choice{ .action = .login }).eql(picker.selected_choice.?));
     try std.testing.expectEqual(@as(usize, 0), picker.available_sources.count());
-    try std.testing.expectEqual(@as(usize, 5), picker.choiceCount());
+    try std.testing.expectEqual(@as(usize, 7), picker.choiceCount());
     try std.testing.expect(!picker.choiceEnabled(.{ .action = .change_team }));
     try std.testing.expectEqualStrings("missing", picker.activeSourceLabel());
 }
@@ -2277,12 +2370,13 @@ test "auth onboarding picker exposes the setup paths" {
 
     const picker = runtime.pickerView();
     try std.testing.expect(picker.include_skip);
-    try std.testing.expectEqual(@as(usize, 3), picker.choiceCount());
+    try std.testing.expectEqual(@as(usize, 4), picker.choiceCount());
     try std.testing.expect((Choice{ .action = .login }).eql(picker.choiceAt(0).?));
     try std.testing.expect((Choice{ .action = .chatgpt_login }).eql(picker.choiceAt(1).?));
-    try std.testing.expect((Choice{ .action = .setup }).eql(picker.choiceAt(2).?));
-    try std.testing.expectEqualStrings("Add an API key", picker.choiceLabel(picker.choiceAt(2).?));
-    try std.testing.expect(picker.choiceAt(3) == null);
+    try std.testing.expect((Choice{ .action = .grok_login }).eql(picker.choiceAt(2).?));
+    try std.testing.expect((Choice{ .action = .setup }).eql(picker.choiceAt(3).?));
+    try std.testing.expectEqualStrings("Add an API key", picker.choiceLabel(picker.choiceAt(3).?));
+    try std.testing.expect(picker.choiceAt(4) == null);
 }
 
 test "clearing a remembered choice re-resolves even when no login was active" {
@@ -2337,6 +2431,20 @@ test "switch credential stage includes the active source and pops to its root ac
     try std.testing.expect(root_view.active);
     try std.testing.expectEqual(PickerStage.root, root_view.stage);
     try std.testing.expect((Choice{ .action = .switch_credential }).eql(root_view.selected_choice.?));
+}
+
+test "provider stage pops to its setup root action" {
+    const alloc = std.testing.allocator;
+    var runtime: Runtime = .{};
+    defer runtime.deinit(alloc);
+    runtime.openPicker(alloc);
+    runtime.openProviderPicker(alloc, .codex);
+
+    try std.testing.expect(runtime.popPickerStage(alloc));
+    const root_view = runtime.pickerView();
+    try std.testing.expect(root_view.active);
+    try std.testing.expectEqual(PickerStage.root, root_view.stage);
+    try std.testing.expectEqualStrings("Switch provider", root_view.choiceLabel(root_view.selected_choice.?));
 }
 
 test "change team stage owns fetched rows and releases them when popped" {

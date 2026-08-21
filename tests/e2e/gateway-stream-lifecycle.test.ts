@@ -2482,7 +2482,7 @@ describe("gateway stream lifecycle", () => {
       expect(output).toContain("AccessDenied");
       expect(output).toContain("Do not retry");
       expect(output).toContain("symlink");
-      expect(output).toContain("/sandbox none");
+      expect(output).toContain("fx permissions");
     } finally {
       gateway.stop();
       chmodSync(blockedPath, 0o700);

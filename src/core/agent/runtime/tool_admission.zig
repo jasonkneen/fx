@@ -677,7 +677,7 @@ fn tracePermissionRequest(
     target_class: []const u8,
     ctx: TraceContext,
 ) void {
-    debug_trace.eventf("permission", "before_permission_wait", ctx, "call_id={s} tool_name={s} permission_mode={s} local_grants={d} outside_workspace={s} sandbox_outcome=not_applicable", .{ call.id, call.name, @tagName(mode), local_grant_count, target_class });
+    debug_trace.eventf("permission", "before_permission_wait", ctx, "call_id={s} tool_name={s} permission_mode={s} local_grants={d} outside_workspace={s}", .{ call.id, call.name, @tagName(mode), local_grant_count, target_class });
     debug_trace.eventf("permission", "permission_requested", ctx, "call_id={s} tool_name={s} permission_mode={s} outside_workspace={s}", .{ call.id, call.name, @tagName(mode), target_class });
 }
 
@@ -713,55 +713,6 @@ fn tracePermissionOutcome(
         debug_trace.eventf("permission", "after_permission_decision", ctx, "call_id={s} tool_name={s} permission_mode={s} decision={s} approval_source={s} outside_workspace={s}", .{ call.id, call.name, @tagName(mode), permissionDecisionName(outcome.decision), source, target_class });
         debug_trace.eventf("permission", "permission_decision", ctx, "call_id={s} tool_name={s} permission_mode={s} decision={s} approval_source={s} outside_workspace={s}", .{ call.id, call.name, @tagName(mode), permissionDecisionName(outcome.decision), source, target_class });
     }
-}
-
-pub fn requestSandboxWideningTraced(
-    hooks: *const AgentRuntimeDeps,
-    arena: Allocator,
-    call: ToolCall,
-    review_turn: permission_auto_classifier.ReviewTurnContext,
-    mode: PermissionMode,
-    local_grants: []const PermissionGrant,
-    live_authority: ?runtime_tool_contracts.LiveToolAuthority,
-    advertised_dynamic_tool_names: []const []const u8,
-    required: runtime_tool_contracts.SandboxScopeRequired,
-    cancel_flag: *std.atomic.Value(bool),
-    ctx: TraceContext,
-) !command_admission.PermissionOutcome {
-    debug_trace.eventf(
-        "permission",
-        "sandbox_widening_requested",
-        ctx,
-        "call_id={s} tool_name={s} phase={s}",
-        .{ call.id, call.name, @tagName(required.phase) },
-    );
-    const outcome = try hooks.request_sandbox_widening(
-        hooks.ctx,
-        arena,
-        call,
-        review_turn,
-        mode,
-        local_grants,
-        live_authority,
-        advertised_dynamic_tool_names,
-        required,
-    );
-    debug_trace.eventf(
-        "permission",
-        "sandbox_widening_decision",
-        ctx,
-        "call_id={s} tool_name={s} phase={s} decision={s}",
-        .{
-            call.id,
-            call.name,
-            @tagName(required.phase),
-            permissionDecisionName(outcome.decision),
-        },
-    );
-    if (outcome.decision.isDenied() and cancel_flag.load(.seq_cst)) {
-        return error.Cancelled;
-    }
-    return outcome;
 }
 
 fn classifyPermissionTarget(hooks: *const AgentRuntimeDeps, arena: Allocator, call: ToolCall, advertised_dynamic_tool_names: []const []const u8, workspace_root: []const u8) []const u8 {
@@ -1123,9 +1074,6 @@ pub fn applyInitialSessionGrants(
         target_kind,
     );
     for (grants) |grant| {
-        // A broader sandbox retry is a separate scope and must receive its own
-        // decision. Only that widening decision may retain a sandbox grant.
-        if (std.mem.eql(u8, grant.tool_name, "sandbox")) continue;
         try appendLocalGrant(arena, local_grants, grant);
         try propagateGrant(hooks, grant);
     }

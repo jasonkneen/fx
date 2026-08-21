@@ -1,7 +1,6 @@
 const std = @import("std");
 const direct_runtime = @import("../terminal/direct_runtime.zig");
 const identity = @import("../terminal/identity.zig");
-const app_permission_runtime = @import("app_permission_runtime.zig");
 const app_session_runtime = @import("app_session_runtime.zig");
 const paste_blocks = @import("../input/pasted_blocks.zig");
 const debug_trace = @import("../shared/debug_trace.zig");
@@ -40,8 +39,6 @@ pub fn Runtime(comptime App: type) type {
                 .profile_user = profile_user,
                 .durable_session_id = durable_session_id,
                 .workspace_root = app.workspace_root,
-                .sandbox_backend = app_permission_runtime.Runtime(App)
-                    .livePermissionSnapshot(app).sandbox_backend,
                 .command = command,
             }) catch |err| {
                 try writeAdmissionFailure(app, @errorName(err));

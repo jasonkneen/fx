@@ -78,6 +78,7 @@ pub fn inspect(
         alloc,
         request.api_key,
         request.credential_source,
+        null,
         request.gateway_team,
         request.session_id,
         model,

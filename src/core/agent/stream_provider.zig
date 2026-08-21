@@ -108,6 +108,8 @@ pub const BuildRequest = struct {
 pub const Request = struct {
     api_key: []const u8,
     credential_source: ?types.CredentialSource = null,
+    /// Borrowed provider account identity captured with the admitted credential.
+    account_id: ?[]const u8 = null,
     team: ?[]const u8,
     /// Borrowed for the duration of `Provider.stream`.
     session_id: ?[]const u8 = null,
@@ -117,6 +119,9 @@ pub const Request = struct {
     payload: []const u8,
     trace_ctx: debug_trace.TraceContext,
     content_capture_limit: ?usize,
+    /// Optional absolute provider deadline. Transports that support bounded
+    /// execution must stop in-flight I/O before returning `error.Timeout`.
+    deadline: ?std.Io.Clock.Timestamp = null,
     cooperative_pulse: ?CooperativePulse = null,
     delivery: *DeliveryCertainty,
     attempt_evidence: *AttemptEvidence,
