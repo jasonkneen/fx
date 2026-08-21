@@ -59,6 +59,7 @@ pub const SlashKind = enum {
     usage,
     undo,
     mcp,
+    acp,
     skills,
     copy,
     feedback,
