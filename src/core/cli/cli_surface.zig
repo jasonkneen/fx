@@ -5,6 +5,7 @@ const app_lifecycle = @import("../app/app_lifecycle.zig");
 const background_record_liveness = @import("../background/background_record_liveness.zig");
 const background_store = @import("../background/background_store.zig");
 const chatgpt_oauth = @import("../auth/chatgpt_oauth.zig");
+const claude_oauth = @import("../auth/claude_oauth.zig");
 const grok_oauth = @import("../auth/grok_oauth.zig");
 const acp_runner = @import("acp_runner.zig");
 const cli_ask = @import("cli_ask.zig");
@@ -183,6 +184,9 @@ pub const Config = struct {
     grok_agent_stream: ?agent_stream_provider.Provider = null,
     grok_cli_model_catalog: ?gateway_provider.CliModelCatalogProvider = null,
     grok_model_catalog: ?model_catalog.Provider = null,
+    claude_agent_stream: ?agent_stream_provider.Provider = null,
+    claude_cli_model_catalog: ?gateway_provider.CliModelCatalogProvider = null,
+    claude_model_catalog: ?model_catalog.Provider = null,
     background_process_provider: background_process_provider.Provider =
         background_process_provider.unavailable_provider,
     url_opener: host.UrlOpener,
@@ -206,6 +210,7 @@ pub const Config = struct {
     permission_reviewer_provider: ?permission_auto_classifier.Provider = null,
     codex_permission_reviewer_provider: ?permission_auto_classifier.Provider = null,
     grok_permission_reviewer_provider: ?permission_auto_classifier.Provider = null,
+    claude_permission_reviewer_provider: ?permission_auto_classifier.Provider = null,
 };
 
 const LocalSurfaceOptions = struct {
@@ -694,6 +699,7 @@ fn activateProviderSelection(
             .gateway => "Gateway is already selected.\n",
             .codex => "Codex is already selected.\n",
             .grok => "Grok is already selected.\n",
+            .claude => "Claude is already selected.\n",
         });
         return true;
     }
@@ -731,6 +737,22 @@ fn activateProviderSelection(
             settings.credential_source,
         );
     }
+    if (resolution.credential == null and target == .claude and caller == .provider_command) {
+        claude_oauth.runLogin(alloc, cfg.gateway_provider.oauth_transport, cfg.url_opener) catch |err| {
+            debug_trace.logf("auth", "provider selection Claude login failed err={s}", .{@errorName(err)});
+            try writeProviderActivationError(alloc, deps, caller, "Claude login failed");
+            return false;
+        };
+        performed_login = .claude;
+        resolution = try credentials.resolveForProvider(
+            alloc,
+            cfg.gateway_provider.oauth_transport,
+            cfg.secret_store,
+            .refresh_if_needed,
+            target,
+            settings.credential_source,
+        );
+    }
 
     const credential = if (resolution.credential) |*value| value else {
         try writeProviderActivationError(
@@ -740,6 +762,7 @@ fn activateProviderSelection(
             switch (target) {
                 .codex => "Codex credential is unavailable",
                 .grok => "Grok credential is unavailable",
+                .claude => "Claude credential is unavailable",
                 .gateway => "configure a Gateway credential first",
             },
         );
@@ -752,6 +775,10 @@ fn activateProviderSelection(
         },
         .grok => cfg.grok_model_catalog orelse {
             try writeProviderActivationError(alloc, deps, caller, "Grok model catalog is unavailable");
+            return false;
+        },
+        .claude => cfg.claude_model_catalog orelse {
+            try writeProviderActivationError(alloc, deps, caller, "Claude model catalog is unavailable");
             return false;
         },
         .gateway => cfg.gateway_provider.model_catalog,
@@ -780,6 +807,7 @@ fn activateProviderSelection(
         .gateway => settings.model,
         .codex => settings.codex_model,
         .grok => settings.grok_model,
+        .claude => settings.claude_model,
     };
     const selected_model = selectCatalogModel(loaded.catalog.items, saved_model) orelse {
         try writeProviderActivationError(alloc, deps, caller, "target model catalog is empty");
@@ -789,6 +817,7 @@ fn activateProviderSelection(
         .gateway => .{ .provider = target, .model = selected_model },
         .codex => .{ .provider = target, .codex_model = selected_model },
         .grok => .{ .provider = target, .grok_model = selected_model },
+        .claude => .{ .provider = target, .claude_model = selected_model },
     });
     defer attempt.deinit(alloc);
     switch (attempt) {
@@ -802,6 +831,7 @@ fn activateProviderSelection(
     if (performed_login) |provider| switch (provider) {
         .codex => try writeStdout(deps, "Signed in with Codex.\n"),
         .grok => try writeStdout(deps, "Signed in with Grok.\n"),
+        .claude => try writeStdout(deps, "Signed in with Claude.\n"),
         .gateway => unreachable,
     };
     if (caller == .provider_command) {
@@ -809,6 +839,7 @@ fn activateProviderSelection(
             .gateway => "Provider set to Gateway.\n",
             .codex => "Provider set to Codex.\n",
             .grok => "Provider set to Grok.\n",
+            .claude => "Provider set to Claude.\n",
         });
     }
     return true;
@@ -905,6 +936,8 @@ fn runNonInteractiveWithDeps(
                 .codex_model_catalog = cfg.codex_model_catalog,
                 .grok_agent_stream = cfg.grok_agent_stream,
                 .grok_model_catalog = cfg.grok_model_catalog,
+                .claude_agent_stream = cfg.claude_agent_stream,
+                .claude_model_catalog = cfg.claude_model_catalog,
                 .background_process_provider = cfg.background_process_provider,
                 .secret_store = cfg.secret_store,
                 .prompt_policy = cfg.prompt_policy,
@@ -921,6 +954,7 @@ fn runNonInteractiveWithDeps(
                 .permission_reviewer_provider = cfg.permission_reviewer_provider,
                 .codex_permission_reviewer_provider = cfg.codex_permission_reviewer_provider,
                 .grok_permission_reviewer_provider = cfg.grok_permission_reviewer_provider,
+                .claude_permission_reviewer_provider = cfg.claude_permission_reviewer_provider,
                 .context_limit_overrides = global_args.modifiers.context_limit_overrides,
                 .additional_directories = global_args.modifiers.additional_directories,
                 .saved_directories_suppressed = global_args.modifiers.saved_directories_suppressed,
@@ -933,7 +967,7 @@ fn runNonInteractiveWithDeps(
         .issue => |rest| return runGithubWorkflow(alloc, rest, cfg, global_args.modifiers, deps, .issue),
         .login => |rest| {
             const maybe_login_provider = parseLoginProvider(rest) catch {
-                try writeStderr(deps, "usage: fx login [vercel|codex|grok]\n");
+                try writeStderr(deps, "usage: fx login [vercel|codex|grok|claude]\n");
                 return .handled_failure;
             };
             // Preserve the original `fx login` behavior for scripts and users.
@@ -987,12 +1021,27 @@ fn runNonInteractiveWithDeps(
                     }
                     try writeStdout(deps, "Signed in with Grok.\n");
                 },
+                .claude => {
+                    claude_oauth.runLogin(
+                        alloc,
+                        cfg.gateway_provider.oauth_transport,
+                        cfg.url_opener,
+                    ) catch |err| {
+                        debug_trace.logf("auth", "Claude login failed err={s}", .{@errorName(err)});
+                        try writeStderr(deps, "fx login: failed to sign in with Claude\n");
+                        return .handled_failure;
+                    };
+                    if (!try activateProviderSelection(alloc, cfg, deps, .claude, .provider_login)) {
+                        return .handled_failure;
+                    }
+                    try writeStdout(deps, "Signed in with Claude.\n");
+                },
             }
             return .handled_success;
         },
         .logout => |rest| {
             const maybe_login_provider = parseLoginProvider(rest) catch {
-                try writeStderr(deps, "usage: fx logout [vercel|codex|grok]\n");
+                try writeStderr(deps, "usage: fx logout [vercel|codex|grok|claude]\n");
                 return .handled_failure;
             };
             // Preserve the original `fx logout` behavior for scripts and users.
@@ -1036,6 +1085,29 @@ fn runNonInteractiveWithDeps(
                     },
                     .deleted_not_durable => result: {
                         try writeStderr(deps, "fx logout: failed to durably remove saved Grok login\n");
+                        break :result .handled_failure;
+                    },
+                };
+            }
+            if (login_provider == .claude) {
+                const outcome = claude_oauth.logout(alloc, cfg.gateway_provider.oauth_transport) catch {
+                    try writeStderr(deps, "fx logout: failed to durably remove saved Claude login\n");
+                    return .handled_failure;
+                };
+                if (outcome.revocation_failed) {
+                    try writeStderr(deps, "fx logout: local Claude session removed, but remote revocation could not be confirmed\n");
+                }
+                return switch (outcome.deletion) {
+                    .deleted => result: {
+                        try writeStdout(deps, "Signed out of Claude.\n");
+                        break :result .handled_success;
+                    },
+                    .missing => result: {
+                        try writeStdout(deps, "No Claude login session found.\n");
+                        break :result .handled_success;
+                    },
+                    .deleted_not_durable => result: {
+                        try writeStderr(deps, "fx logout: failed to durably remove saved Claude login\n");
                         break :result .handled_failure;
                     },
                 };
@@ -1175,6 +1247,10 @@ fn runNonInteractiveWithDeps(
                 },
                 .grok => cfg.grok_cli_model_catalog orelse {
                     try writeStderr(deps, "fx models: Grok model catalog is unavailable\n");
+                    return .handled_failure;
+                },
+                .claude => cfg.claude_cli_model_catalog orelse {
+                    try writeStderr(deps, "fx models: Claude model catalog is unavailable\n");
                     return .handled_failure;
                 },
                 .gateway => cfg.gateway_provider.cli_model_catalog,
@@ -2993,6 +3069,8 @@ fn workflowConfig(cfg: Config) @import("cli_ask.zig").Config {
         .codex_model_catalog = cfg.codex_model_catalog,
         .grok_agent_stream = cfg.grok_agent_stream,
         .grok_model_catalog = cfg.grok_model_catalog,
+        .claude_agent_stream = cfg.claude_agent_stream,
+        .claude_model_catalog = cfg.claude_model_catalog,
         .background_process_provider = cfg.background_process_provider,
         .secret_store = cfg.secret_store,
         .prompt_policy = cfg.prompt_policy,
@@ -3010,6 +3088,7 @@ fn workflowConfig(cfg: Config) @import("cli_ask.zig").Config {
         .permission_reviewer_provider = cfg.permission_reviewer_provider,
         .codex_permission_reviewer_provider = cfg.codex_permission_reviewer_provider,
         .grok_permission_reviewer_provider = cfg.grok_permission_reviewer_provider,
+        .claude_permission_reviewer_provider = cfg.claude_permission_reviewer_provider,
     };
 }
 

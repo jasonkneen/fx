@@ -9,6 +9,7 @@ const credentials = @import("../auth/credentials.zig");
 const auth_runtime = @import("../auth/auth_runtime.zig");
 const login_flow = @import("../auth/login_flow.zig");
 const chatgpt_oauth = @import("../auth/chatgpt_oauth.zig");
+const claude_oauth = @import("../auth/claude_oauth.zig");
 const grok_oauth = @import("../auth/grok_oauth.zig");
 const provider_catalog = @import("../auth/provider_catalog.zig");
 const model_provider = @import("../config/model_provider.zig");
@@ -79,6 +80,7 @@ pub fn Runtime(comptime App: type) type {
                 const required_source: credentials.Source = switch (provider) {
                     .codex => .chatgpt_subscription,
                     .grok => .grok_subscription,
+                    .claude => .claude_subscription,
                     .gateway => app.auth.credentialSource() orelse .fx_login,
                 };
                 const route_change = app.auth.selectForProvider(app.alloc, provider) catch |err| switch (err) {
@@ -176,6 +178,48 @@ pub fn Runtime(comptime App: type) type {
             const grok_is_only_logout_session = provider_inventory.contains(.grok_subscription) and
                 !provider_inventory.contains(.fx_login) and
                 !provider_inventory.contains(.chatgpt_subscription);
+            const claude_is_only_logout_session = provider_inventory.contains(.claude_subscription) and
+                !provider_inventory.contains(.fx_login) and
+                !provider_inventory.contains(.chatgpt_subscription) and
+                !provider_inventory.contains(.grok_subscription);
+            const selected_model_uses_claude = if (comptime provider_runtime.supported(App))
+                provider_runtime.provider(app) == .claude
+            else
+                false;
+            const logout_claude = if (requested_provider) |provider|
+                provider == .claude
+            else
+                selected_model_uses_claude or
+                    app.auth.credentialSource() == .claude_subscription or
+                    claude_is_only_logout_session;
+            if (logout_claude) {
+                const outcome = claude_oauth.logout(app.alloc, app.auth.oauthTransport()) catch {
+                    try writeAuthNotice(app, .{
+                        .topic = "auth",
+                        .tone = .@"error",
+                        .body = "Could not durably sign out of Claude. The current source is unchanged.",
+                    });
+                    return;
+                };
+                const changed = if (comptime @hasDecl(@TypeOf(app.auth), "reconcileAfterClaudeLogout"))
+                    try app.auth.reconcileAfterClaudeLogout(app.alloc)
+                else
+                    false;
+                applyCredentialChange(app, changed);
+                try writeAuthNotice(app, switch (outcome.deletion) {
+                    .deleted => .{ .topic = "auth", .tone = .neutral, .body = "Signed out of Claude." },
+                    .missing => .{ .topic = "auth", .tone = .neutral, .body = "No Claude login session found." },
+                    .deleted_not_durable => .{ .topic = "auth", .tone = .warning, .body = "Signed out of Claude, but could not confirm the profile directory update." },
+                });
+                if (outcome.revocation_failed) {
+                    try writeAuthNotice(app, .{
+                        .topic = "auth",
+                        .tone = .warning,
+                        .body = "The local Claude session was removed, but remote revocation could not be confirmed.",
+                    });
+                }
+                return;
+            }
             const logout_grok = if (requested_provider) |provider|
                 provider == .grok
             else
@@ -471,6 +515,39 @@ pub fn Runtime(comptime App: type) type {
                                 .topic = "auth",
                                 .tone = .neutral,
                                 .body = "Signed in with Grok.",
+                            });
+                        },
+                        .claude => {
+                            try app.auth.refreshSourceInventory(app.alloc);
+                            if (comptime provider_runtime.supported(App)) {
+                                app.auth.closePicker(app.alloc);
+                                try switchProvider(app, .claude, false, .post_oauth);
+                                return;
+                            }
+                            const selected_model_uses_claude = if (comptime provider_runtime.supported(App))
+                                provider_runtime.provider(app) == .claude
+                            else
+                                false;
+                            if (selected_model_uses_claude and
+                                !try selectCredentialSource(app, .claude_subscription))
+                            {
+                                _ = app.auth.popPickerStage(app.alloc);
+                                try writeAuthNotice(app, .{
+                                    .topic = "auth",
+                                    .tone = .@"error",
+                                    .body = "Signed in, but the Claude subscription credential could not be loaded.",
+                                });
+                                return;
+                            }
+                            if (!selected_model_uses_claude) {
+                                app.model_cache.reset();
+                                if (comptime @hasDecl(App, "startModelCacheWarmup")) app.startModelCacheWarmup();
+                            }
+                            app.auth.closePicker(app.alloc);
+                            try writeAuthNotice(app, .{
+                                .topic = "auth",
+                                .tone = .neutral,
+                                .body = "Signed in with Claude.",
                             });
                         },
                     }
@@ -920,6 +997,7 @@ pub fn Runtime(comptime App: type) type {
                 .gateway => settings.model,
                 .codex => settings.codex_model,
                 .grok => settings.grok_model,
+                .claude => settings.claude_model,
             };
             const current_model = if (intent == .post_oauth and current == target)
                 provider_runtime.model(app)
@@ -1411,6 +1489,7 @@ test "interactive subscription sign-in rejects active and queued work before OAu
             switch (provider) {
                 .codex => try Runtime(BusySignInApp).beginChatGptSignIn(&app),
                 .grok => try Runtime(BusySignInApp).beginGrokSignIn(&app),
+                .claude => unreachable,
                 .gateway => unreachable,
             }
 

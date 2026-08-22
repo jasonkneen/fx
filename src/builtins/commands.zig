@@ -89,13 +89,13 @@ pub const top_level_specs = [_]TopLevelSpec{
     .{
         .kind = .login,
         .token = "login",
-        .usage = "login [vercel|codex|grok]",
+        .usage = "login [vercel|codex|grok|claude]",
         .summary = "Sign in to Vercel or a selected provider",
     },
     .{
         .kind = .logout,
         .token = "logout",
-        .usage = "logout [vercel|codex|grok]",
+        .usage = "logout [vercel|codex|grok|claude]",
         .summary = "Sign out of Vercel or a selected provider session",
     },
     .{
@@ -292,9 +292,9 @@ pub const top_level_help_groups = [_]TopLevelHelpGroup{
         .{ .kind = .replay, .usage = "replay <tape>" },
     } },
     .{ .entries = &.{
-        .{ .kind = .login, .usage = "login [vercel|codex|grok]" },
-        .{ .kind = .logout, .usage = "logout [vercel|codex|grok]" },
-        .{ .kind = .provider, .usage = "provider <gateway|codex|grok>" },
+        .{ .kind = .login, .usage = "login [vercel|codex|grok|claude]" },
+        .{ .kind = .logout, .usage = "logout [vercel|codex|grok|claude]" },
+        .{ .kind = .provider, .usage = "provider <gateway|codex|grok|claude>" },
         .{ .kind = .setup, .usage = "setup" },
         .{ .kind = .teams, .usage = "teams" },
         .{ .kind = .credits, .usage = "credits|balance" },

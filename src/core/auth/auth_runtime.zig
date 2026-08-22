@@ -2,6 +2,7 @@ const std = @import("std");
 const api_key_validator = @import("api_key_validator.zig");
 const credentials = @import("credentials.zig");
 const chatgpt_oauth = @import("chatgpt_oauth.zig");
+const claude_oauth = @import("claude_oauth.zig");
 const grok_oauth = @import("grok_oauth.zig");
 const host = @import("../hosts/host.zig");
 const host_target = @import("../hosts/target.zig");
@@ -133,6 +134,10 @@ pub fn refreshCredentialTokenForAccount(
         .grok_subscription => switch (mode) {
             .if_needed => (try credentials.loadSource(alloc, transport, host.unavailable_secret_store, source)) orelse return null,
             .force => (try credentials.refreshGrokCredential(alloc, transport)) orelse return null,
+        },
+        .claude_subscription => switch (mode) {
+            .if_needed => (try credentials.loadSource(alloc, transport, host.unavailable_secret_store, source)) orelse return null,
+            .force => (try credentials.refreshClaudeCredential(alloc, transport)) orelse return null,
         },
         else => unreachable,
     };
@@ -1118,6 +1123,7 @@ pub const Runtime = struct {
             .fx_login => try self.sign_in_flow.start(alloc, self.oauth_transport),
             .chatgpt_subscription => try chatgpt_oauth.startSignIn(&self.sign_in_flow, alloc, self.oauth_transport),
             .grok_subscription => try grok_oauth.startSignIn(&self.sign_in_flow, alloc, self.oauth_transport),
+            .claude_subscription => try claude_oauth.startSignIn(&self.sign_in_flow, alloc, self.oauth_transport),
             else => return error.InvalidSignInSource,
         };
         if (!started) return false;
@@ -1422,7 +1428,16 @@ pub const Runtime = struct {
                     self,
                     loadRuntimeCredentialSource,
                 ),
-            .gateway => if (self.credentialSource() != .chatgpt_subscription and self.credentialSource() != .grok_subscription)
+            .claude => if (self.credentialSource() == .claude_subscription)
+                false
+            else
+                self.selectSourceWithLoader(
+                    alloc,
+                    .claude_subscription,
+                    self,
+                    loadRuntimeCredentialSource,
+                ),
+            .gateway => if (self.credentialSource() != .chatgpt_subscription and self.credentialSource() != .grok_subscription and self.credentialSource() != .claude_subscription)
                 false
             else
                 @as(?bool, try self.reselectByPrecedenceWithDeps(

@@ -268,6 +268,8 @@ fn composeSignInPickerRow(
             "   Sign in with Codex"
         else if (source == .grok_subscription)
             "   Sign in with Grok"
+        else if (source == .claude_subscription)
+            "   Sign in with Claude"
         else
             "   Sign in with Vercel",
         1, 4 => "",
@@ -279,9 +281,13 @@ fn composeSignInPickerRow(
             "   Open the Codex authorization page"
         else if (source == .grok_subscription)
             "   Open the Grok authorization page"
+        else if (source == .claude_subscription)
+            "   Open the Claude authorization page"
         else
             "   Open the Vercel device authorization page",
-        3 => if (snapshot.user_code.len == 0)
+        3 => if (source == .claude_subscription)
+            "   Paste the authorization code from the browser"
+        else if (snapshot.user_code.len == 0)
             ""
         else
             std.fmt.bufPrint(
@@ -296,7 +302,10 @@ fn composeSignInPickerRow(
             .failed => "   Sign-in failed",
             .cancelled => "   Sign-in cancelled",
         },
-        6 => "   Enter reopens browser · Esc cancels",
+        6 => if (source == .claude_subscription)
+            "   Enter reopens browser · paste the code in the terminal · Esc cancels"
+        else
+            "   Enter reopens browser · Esc cancels",
         else => "",
     };
     try row_text.appendClipped(alloc, &row, label, width);
