@@ -5,6 +5,7 @@ const app_lifecycle = @import("../app/app_lifecycle.zig");
 const background_record_liveness = @import("../background/background_record_liveness.zig");
 const background_store = @import("../background/background_store.zig");
 const chatgpt_oauth = @import("../auth/chatgpt_oauth.zig");
+const claude_code_store = @import("../auth/claude_code_store.zig");
 const claude_oauth = @import("../auth/claude_oauth.zig");
 const grok_oauth = @import("../auth/grok_oauth.zig");
 const acp_runner = @import("acp_runner.zig");
@@ -406,6 +407,17 @@ fn parseGlobalLaunchArgs(
         } else if (std.mem.eql(u8, arg, "--no-additional-dirs")) {
             if (suppress_saved) return error.DuplicateAdditionalDirectorySuppression;
             suppress_saved = true;
+        } else if (std.mem.eql(u8, arg, "--claude-tools")) {
+            index += 1;
+            if (index >= args.len) return error.MissingClaudeToolsValue;
+            const enabled = claude_code_store.parseToolsToggle(args[index]) orelse
+                return error.InvalidClaudeToolsValue;
+            claude_code_store.setClaudeCodeToolsFromCli(enabled);
+        } else if (std.mem.startsWith(u8, arg, "--claude-tools=")) {
+            const value = arg["--claude-tools=".len..];
+            const enabled = claude_code_store.parseToolsToggle(value) orelse
+                return error.InvalidClaudeToolsValue;
+            claude_code_store.setClaudeCodeToolsFromCli(enabled);
         } else {
             break;
         }
@@ -432,11 +444,15 @@ pub fn commandAfterGlobalLaunchArgs(args: []const [:0]const u8) ?[]const u8 {
     var index: usize = 0;
     while (index < args.len) {
         const arg = args[index];
-        if (std.mem.eql(u8, arg, "--context-limit") or std.mem.eql(u8, arg, "--add-dir")) {
+        if (std.mem.eql(u8, arg, "--context-limit") or
+            std.mem.eql(u8, arg, "--add-dir") or
+            std.mem.eql(u8, arg, "--claude-tools"))
+        {
             index += 1;
             if (index >= args.len) return null;
         } else if (!std.mem.startsWith(u8, arg, "--context-limit=") and
             !std.mem.startsWith(u8, arg, "--add-dir=") and
+            !std.mem.startsWith(u8, arg, "--claude-tools=") and
             !std.mem.eql(u8, arg, "--no-additional-dirs"))
         {
             return arg;
@@ -862,7 +878,7 @@ fn runIfRequestedWithDeps(alloc: Allocator, args: []const [:0]const u8, cfg: Con
         } else {
             try writer.writer.print("fx: invalid global launch option: {s}\n", .{@errorName(err)});
         }
-        try writer.writer.writeAll("usage: fx [--context-limit NAME=BYTES|off] [--add-dir PATH]... [--no-additional-dirs] <command>\n");
+        try writer.writer.writeAll("usage: fx [--context-limit NAME=BYTES|off] [--add-dir PATH]... [--no-additional-dirs] [--claude-tools on|off] <command>\n");
         try writeStderr(deps, writer.written());
         return .handled_failure;
     };
@@ -966,6 +982,7 @@ fn runNonInteractiveWithDeps(
         .pr => |rest| return runGithubWorkflow(alloc, rest, cfg, global_args.modifiers, deps, .pull_request),
         .issue => |rest| return runGithubWorkflow(alloc, rest, cfg, global_args.modifiers, deps, .issue),
         .login => |rest| {
+            debug_trace.configureFromEnv(alloc, ".");
             const maybe_login_provider = parseLoginProvider(rest) catch {
                 try writeStderr(deps, "usage: fx login [vercel|codex|grok|claude]\n");
                 return .handled_failure;
@@ -1028,7 +1045,17 @@ fn runNonInteractiveWithDeps(
                         cfg.url_opener,
                     ) catch |err| {
                         debug_trace.logf("auth", "Claude login failed err={s}", .{@errorName(err)});
-                        try writeStderr(deps, "fx login: failed to sign in with Claude\n");
+                        const message = switch (err) {
+                            error.ClaudeOAuthRequestFailed => "fx login: Claude rejected the authorization code. Request a new code and try again.\n",
+                            error.ClaudeOAuthStateMismatch => "fx login: Claude authorization state did not match. Request a new code and try again.\n",
+                            error.ClaudeUserInfoRequestFailed => "fx login: Claude accepted the token but rejected the profile request\n",
+                            error.InvalidClaudeUserInfoResponse => "fx login: Claude accepted the token but returned an unexpected profile\n",
+                            error.InvalidClaudeOAuthResponse => "fx login: Claude returned an unexpected token response\n",
+                            error.ClaudeRefreshTokenMissing => "fx login: Claude did not return a refresh token\n",
+                            error.LoginTimedOut => "fx login: Claude authorization expired; run fx login claude again\n",
+                            else => "fx login: failed to sign in with Claude\n",
+                        };
+                        try writeStderr(deps, message);
                         return .handled_failure;
                     };
                     if (!try activateProviderSelection(alloc, cfg, deps, .claude, .provider_login)) {
@@ -1153,11 +1180,11 @@ fn runNonInteractiveWithDeps(
         },
         .provider => |rest| {
             if (rest.len != 1) {
-                try writeStderr(deps, "usage: fx provider <gateway|codex|grok>\n");
+                try writeStderr(deps, "usage: fx provider <gateway|codex|grok|claude>\n");
                 return .handled_failure;
             }
             const target = model_provider.parse(rest[0]) orelse {
-                try writeStderr(deps, "fx provider: expected gateway, codex, or grok\n");
+                try writeStderr(deps, "fx provider: expected gateway, codex, grok, or claude\n");
                 return .handled_failure;
             };
             return if (try activateProviderSelection(alloc, cfg, deps, target, .provider_command))
@@ -3121,6 +3148,8 @@ fn globalLaunchErrorMessage(err: anyerror) ?[]const u8 {
     return switch (err) {
         error.MissingAddDirectoryValue => "--add-dir requires a directory path",
         error.DuplicateAdditionalDirectorySuppression => "--no-additional-dirs may only be specified once",
+        error.MissingClaudeToolsValue => "--claude-tools requires on or off",
+        error.InvalidClaudeToolsValue => "--claude-tools requires on or off",
         else => null,
     };
 }

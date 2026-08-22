@@ -49,6 +49,7 @@ pub const Settings = struct {
     first_call_tool_choice: ?types.ToolChoice = null,
     context: ?bool = null,
     fast_mode: ?bool = null,
+    claude_code_tools: ?bool = null,
     slash_menu_categories: ?bool = null,
     auto_upgrade: ?bool = null,
     update_channel: ?update_target.Channel = null,
@@ -69,8 +70,6 @@ pub const Settings = struct {
         if (self.codex_model) |value| alloc.free(value);
         if (self.grok_model) |value| alloc.free(value);
         if (self.claude_model) |value| alloc.free(value);
-        if (self.input_appearance) |value| alloc.free(value);
-        if (self.maxxing_mode) |value| alloc.free(value);
         self.permission_rules.deinit(alloc);
         self.* = .{};
     }
@@ -544,6 +543,7 @@ fn isProfileOnlySettingKey(key: []const u8) bool {
         "claude_model",
         "effort",
         "fast_mode",
+        "claude_code_tools",
         "slash_menu_categories",
         "startup_scrollback",
         "prompt_history",
@@ -1330,6 +1330,12 @@ fn parseProfileOnlyFields(
         const value = fast_mode_value;
         if (value != .bool) return error.InvalidFastModeType;
         settings.fast_mode = value.bool;
+    }
+
+    if (root.object.get("claude_code_tools")) |claude_code_tools_value| {
+        const value = claude_code_tools_value;
+        if (value != .bool) return error.InvalidClaudeCodeToolsType;
+        settings.claude_code_tools = value.bool;
     }
 
     if (root.object.get("slash_menu_categories")) |slash_menu_categories_value| {

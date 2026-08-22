@@ -1,17 +1,19 @@
 const std = @import("std");
 const claude_oauth = @import("../core/auth/claude_oauth.zig");
+const claude_session = @import("../core/auth/claude_session.zig");
 const image_attachments = @import("../core/images/image_attachments.zig");
 const secret = @import("../core/auth/secret.zig");
 const stream_provider = @import("../core/agent/stream_provider.zig");
 const io_mod = @import("../core/shared/io.zig");
 const types = @import("../core/shared/types.zig");
 const gateway_client = @import("client.zig");
+const anthropic_claude_cli = @import("anthropic_claude_cli.zig");
 
 const Allocator = std.mem.Allocator;
 const endpoint = "https://api.anthropic.com/v1/messages";
 const generation_origin = "https://api.anthropic.com/v1";
 const e2e_endpoint_env = "FX_E2E_ANTHROPIC_CLAUDE_MESSAGES_URL";
-const anthropic_version = "2023-06-01";
+const anthropic_version = claude_oauth.anthropic_api_version;
 const max_error_body_bytes: usize = 256 * 1024;
 const max_sse_line_bytes: usize = 1024 * 1024;
 const max_sse_aggregate_bytes: usize = 64 * 1024 * 1024;
@@ -245,6 +247,20 @@ fn streamCompletionCore(alloc: Allocator, request: stream_provider.Request) !str
         return error.ClaudeSubscriptionCredentialRequired;
     }
     try validateModel(request.model);
+    if (io_mod.getenv(e2e_endpoint_env) != null) {
+        return streamHttpCompletion(alloc, request);
+    }
+    return anthropic_claude_cli.streamCompletion(alloc, request);
+}
+
+pub fn streamHttpCompletion(alloc: Allocator, request: stream_provider.Request) !stream_provider.Result {
+    if (request.cancel_flag.load(.seq_cst)) return error.Cancelled;
+    if (request.credential_source != .claude_subscription) {
+        return error.ClaudeSubscriptionCredentialRequired;
+    }
+    const account_id = request.account_id orelse return error.ClaudeSubscriptionAccountRequired;
+    if (!claude_session.validAccountId(account_id)) return error.InvalidClaudeSubscriptionAccount;
+    try validateModel(request.model);
     const auth_header = try std.fmt.allocPrint(alloc, "Bearer {s}", .{request.api_key});
     defer secret.zeroAndFree(alloc, auth_header);
     const request_endpoint = if (io_mod.getenv(e2e_endpoint_env)) |override| endpoint: {
@@ -253,11 +269,15 @@ fn streamCompletionCore(alloc: Allocator, request: stream_provider.Request) !str
     } else endpoint;
     const uri = try std.Uri.parse(request_endpoint);
 
-    var extra_headers_buf: [3]std.http.Header = undefined;
+    var extra_headers_buf: [5]std.http.Header = undefined;
     var extra_count: usize = 0;
     extra_headers_buf[extra_count] = .{ .name = "anthropic-version", .value = anthropic_version };
     extra_count += 1;
-    extra_headers_buf[extra_count] = .{ .name = "originator", .value = "fx" };
+    extra_headers_buf[extra_count] = .{ .name = "anthropic-beta", .value = claude_oauth.messages_beta };
+    extra_count += 1;
+    extra_headers_buf[extra_count] = .{ .name = "anthropic-account-uuid", .value = account_id };
+    extra_count += 1;
+    extra_headers_buf[extra_count] = .{ .name = "originator", .value = claude_oauth.messages_originator };
     extra_count += 1;
     extra_headers_buf[extra_count] = .{ .name = "accept", .value = "text/event-stream" };
     extra_count += 1;
@@ -654,7 +674,7 @@ const OpenRequestOperation = struct {
                 .content_type = .{ .override = "application/json" },
                 .authorization = .{ .override = self.auth_header },
                 .accept_encoding = .omit,
-                .user_agent = .{ .override = gateway_client.user_agent },
+                .user_agent = .{ .override = claude_oauth.messages_user_agent },
             },
             .extra_headers = self.extra_headers,
             .keep_alive = false,

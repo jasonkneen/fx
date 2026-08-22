@@ -208,8 +208,8 @@ pub const missing_chatgpt_credential_message = "fx needs a Codex subscription lo
 pub const missing_chatgpt_interactive_credential_message = "Codex needs a subscription login. Run /login and choose Sign in with Codex.";
 pub const missing_grok_credential_message = "fx needs a Grok subscription login for this model. Run fx login grok.";
 pub const missing_grok_interactive_credential_message = "Grok needs a subscription login. Run /login and choose Sign in with Grok.";
-pub const missing_claude_credential_message = "fx needs a Claude subscription login for this model. Run fx login claude.";
-pub const missing_claude_interactive_credential_message = "Claude needs a subscription login. Run /login and choose Sign in with Claude.";
+pub const missing_claude_credential_message = "fx needs a Claude Code login for this model. Run claude auth login, then fx provider claude.";
+pub const missing_claude_interactive_credential_message = "Claude needs a Claude Code login. Run claude auth login, then choose the Claude provider.";
 pub const unreadable_store_message = "Fx could not read the stored API key from " ++ stored_key_backend_label ++ ". A key may be saved but unreadable. Set FX_TRACE_LOG for the failing step, or set AI_GATEWAY_API_KEY.";
 
 pub const Credential = struct {

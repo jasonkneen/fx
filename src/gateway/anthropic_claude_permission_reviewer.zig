@@ -107,7 +107,7 @@ fn sendReview(
     var evidence: stream_provider.AttemptEvidence = .{};
     var callback_context: u8 = 0;
     const usage_observation = try session_usage.GatewayObservation.begin(config.usage);
-    var result = anthropic_claude.agent_stream_provider.stream(alloc, .{
+    var result = anthropic_claude.streamHttpCompletion(alloc, .{
         .api_key = config.credential,
         .credential_source = .claude_subscription,
         .account_id = config.account_id,

@@ -1,4 +1,5 @@
 const std = @import("std");
+const claude_code_store = @import("claude_code_store.zig");
 const claude_session = @import("claude_session.zig");
 const debug_trace = @import("../shared/debug_trace.zig");
 const host = @import("../hosts/host.zig");
@@ -14,10 +15,17 @@ const Allocator = std.mem.Allocator;
 const client_id = "9d1c250a-e61b-44d9-88ed-5944d1962f5e";
 const issuer_url = "https://claude.ai";
 const authorize_url = "https://claude.ai/oauth/authorize";
-const token_url = "https://platform.claude.com/v1/oauth/token";
+const token_url = "https://console.anthropic.com/v1/oauth/token";
 const userinfo_url = "https://api.anthropic.com/api/oauth/profile";
 pub const anthropic_api_version = "2023-06-01";
 pub const oauth_beta = "oauth-2025-04-20";
+pub const messages_beta = claude_code_store.messages_beta;
+pub const messages_originator = claude_code_store.originator;
+pub const messages_user_agent = claude_code_store.user_agent;
+pub const oauth_api_headers = [_]std.http.Header{
+    .{ .name = "anthropic-version", .value = anthropic_api_version },
+    .{ .name = "anthropic-beta", .value = oauth_beta },
+};
 const e2e_issuer_url_env = "FX_E2E_CLAUDE_ISSUER_URL";
 const e2e_authorize_url_env = "FX_E2E_CLAUDE_AUTHORIZE_URL";
 const e2e_token_url_env = "FX_E2E_CLAUDE_TOKEN_URL";
@@ -248,6 +256,7 @@ fn pollBrowserToken(
             code,
             context.code_verifier,
             context.redirect_uri,
+            context.state,
             cancel_flag,
             deadline,
         );
@@ -288,6 +297,7 @@ fn pollBrowserToken(
         callback.code,
         context.code_verifier,
         context.redirect_uri,
+        context.state,
         cancel_flag,
         deadline,
     ) catch |err| {
@@ -450,7 +460,10 @@ pub fn runLogin(
                 if (std.mem.findScalar(u8, paste_line.items, '\n') != null) {
                     const trimmed = std.mem.trim(u8, paste_line.items, " \t\r\n");
                     if (trimmed.len > 0) {
-                        submitPastedAuthorizationInput(&runtime, alloc, trimmed) catch {};
+                        submitPastedAuthorizationInput(&runtime, alloc, trimmed) catch |err| {
+                            debug_trace.logf("auth", "Claude pasted authorization rejected err={s}", .{@errorName(err)});
+                            return err;
+                        };
                     }
                     std.crypto.secureZero(u8, @volatileCast(paste_line.items));
                     paste_line.clearRetainingCapacity();
@@ -513,6 +526,7 @@ pub fn logout(alloc: Allocator, transport: oauth_transport.Provider) !LogoutResu
 }
 
 pub fn sourceExists(alloc: Allocator) !bool {
+    if (try claude_code_store.hasCredentials(alloc)) return true;
     var session = (try claude_session.load(alloc)) orelse return false;
     defer session.deinit(alloc);
     return true;
@@ -523,6 +537,7 @@ pub fn loadAccess(
     transport: oauth_transport.Provider,
     mode: RefreshMode,
 ) !?Access {
+    if (try loadClaudeCodeAccess(alloc, transport, mode)) |access| return access;
     if (mode == .stored) {
         var session = (try claude_session.load(alloc)) orelse return null;
         defer session.deinit(alloc);
@@ -538,6 +553,77 @@ pub fn loadAccess(
         try refreshSession(alloc, transport, &mutation, &session);
     }
     return takeAccess(&session);
+}
+
+fn loadClaudeCodeAccess(
+    alloc: Allocator,
+    transport: oauth_transport.Provider,
+    mode: RefreshMode,
+) !?Access {
+    var stored = (try claude_code_store.load(alloc)) orelse return null;
+    errdefer stored.deinit(alloc);
+    if (mode != .stored and (mode == .force or stored.expired(io_mod.milliTimestamp()))) {
+        refreshClaudeCodeSession(alloc, transport, &stored) catch |err| {
+            debug_trace.logf("auth", "Claude Code token refresh failed err={s}", .{@errorName(err)});
+            return null;
+        };
+        claude_code_store.save(alloc, stored) catch |err| {
+            debug_trace.logf("auth", "Claude Code token persist failed err={s}", .{@errorName(err)});
+        };
+    }
+    if (stored.account_id.len == 0 or !claude_session.validAccountId(stored.account_id)) {
+        const account_id = fetchAccountId(alloc, transport, stored.access_token) catch |err| {
+            debug_trace.logf("auth", "Claude Code account lookup failed err={s}", .{@errorName(err)});
+            return null;
+        };
+        alloc.free(stored.account_id);
+        stored.account_id = account_id;
+    }
+    if (try claude_code_store.findCli(alloc)) |cli| {
+        defer alloc.free(cli);
+        debug_trace.logf("auth", "Claude Code CLI detected", .{});
+    }
+    const access = Access{
+        .access_token = stored.access_token,
+        .account_id = stored.account_id,
+        .refresh_after_ms = claude_code_store.refreshDeadlineMs(stored.expires_at_ms),
+    };
+    secret.zeroAndFree(alloc, stored.refresh_token);
+    stored.access_token = &.{};
+    stored.refresh_token = &.{};
+    stored.account_id = &.{};
+    return access;
+}
+
+fn refreshClaudeCodeSession(
+    alloc: Allocator,
+    transport: oauth_transport.Provider,
+    stored: *claude_code_store.Stored,
+) !void {
+    const payload = try jsonObjectPayload(alloc, .{
+        .grant_type = "refresh_token",
+        .client_id = client_id,
+        .refresh_token = stored.refresh_token,
+    });
+    defer secret.zeroAndFree(alloc, payload);
+    var token = try requestRefreshToken(alloc, transport, payload);
+    defer token.deinit(alloc);
+    const access_token = token.access_token;
+    token.access_token = &.{};
+    errdefer secret.zeroAndFree(alloc, access_token);
+    const refresh_token = if (token.refresh_token) |rotated| rotated else try alloc.dupe(u8, stored.refresh_token);
+    if (token.refresh_token != null) token.refresh_token = null;
+    errdefer secret.zeroAndFree(alloc, refresh_token);
+    const expires_in = token.expires_in orelse return error.InvalidClaudeOAuthResponse;
+    const duration_ms = std.math.mul(i64, expires_in, std.time.ms_per_s) catch
+        return error.InvalidClaudeOAuthResponse;
+    const expires_at_ms = std.math.add(i64, io_mod.milliTimestamp(), duration_ms) catch
+        return error.InvalidClaudeOAuthResponse;
+    secret.zeroAndFree(alloc, stored.access_token);
+    secret.zeroAndFree(alloc, stored.refresh_token);
+    stored.access_token = access_token;
+    stored.refresh_token = refresh_token;
+    stored.expires_at_ms = expires_at_ms;
 }
 
 fn takeAccess(session: *claude_session.Session) Access {
@@ -558,13 +644,13 @@ fn refreshSession(
     mutation: *claude_session.Mutation,
     session: *claude_session.Session,
 ) !void {
-    var body: std.Io.Writer.Allocating = .init(alloc);
-    defer body.deinit();
-    var form: FormBody = .{};
-    try form.append(&body.writer, "grant_type", "refresh_token");
-    try form.append(&body.writer, "client_id", client_id);
-    try form.append(&body.writer, "refresh_token", session.refresh_token);
-    var token = try requestRefreshToken(alloc, transport, body.written());
+    const payload = try jsonObjectPayload(alloc, .{
+        .grant_type = "refresh_token",
+        .client_id = client_id,
+        .refresh_token = session.refresh_token,
+    });
+    defer secret.zeroAndFree(alloc, payload);
+    var token = try requestRefreshToken(alloc, transport, payload);
     defer token.deinit(alloc);
 
     const account_id = try fetchAccountId(alloc, transport, token.access_token);
@@ -620,7 +706,7 @@ fn requestRefreshToken(
     const bytes = try requestAccepted(
         alloc,
         transport,
-        .post_form,
+        .post_json,
         endpoint_url,
         payload,
     );
@@ -654,18 +740,20 @@ fn exchangeAuthorizationCodeForRedirectWithBounds(
     authorization_code: []const u8,
     code_verifier: []const u8,
     redirect_uri: []const u8,
+    state: []const u8,
     cancel_flag: ?*std.atomic.Value(bool),
     deadline: ?std.Io.Clock.Timestamp,
 ) !TokenSet {
-    var form: FormBody = .{};
-    var body: std.Io.Writer.Allocating = .init(alloc);
-    defer body.deinit();
-    try form.append(&body.writer, "grant_type", "authorization_code");
-    try form.append(&body.writer, "client_id", client_id);
-    try form.append(&body.writer, "code", authorization_code);
-    try form.append(&body.writer, "code_verifier", code_verifier);
-    try form.append(&body.writer, "redirect_uri", redirect_uri);
-    return requestTokenAtWithBounds(alloc, transport, endpoint_url, body.written(), cancel_flag, deadline);
+    const payload = try jsonObjectPayload(alloc, .{
+        .grant_type = "authorization_code",
+        .code = authorization_code,
+        .state = state,
+        .code_verifier = code_verifier,
+        .redirect_uri = redirect_uri,
+        .client_id = client_id,
+    });
+    defer secret.zeroAndFree(alloc, payload);
+    return requestTokenAtWithBounds(alloc, transport, endpoint_url, payload, cancel_flag, deadline);
 }
 
 fn requestTokenAtWithBounds(
@@ -679,7 +767,7 @@ fn requestTokenAtWithBounds(
     const bytes = try requestAcceptedWithBounds(
         alloc,
         transport,
-        .post_form,
+        .post_json,
         endpoint_url,
         payload,
         cancel_flag,
@@ -745,15 +833,11 @@ fn fetchAccountId(
     defer alloc.free(endpoint_url);
     const authorization = try std.fmt.allocPrint(alloc, "Bearer {s}", .{access_token});
     defer secret.zeroAndFree(alloc, authorization);
-    const extra_headers = [_]std.http.Header{
-        .{ .name = "anthropic-version", .value = anthropic_api_version },
-        .{ .name = "anthropic-beta", .value = oauth_beta },
-    };
     var response = try transport.execute(alloc, .{
         .method = .get,
         .url = endpoint_url,
         .authorization = authorization,
-        .extra_headers = &extra_headers,
+        .extra_headers = &oauth_api_headers,
     });
     defer response.deinit(alloc);
     if (response.disposition != .accepted) {
@@ -832,10 +916,27 @@ fn requestAcceptedWithBounds(
     });
     defer response.deinit(alloc);
     if (response.disposition != .accepted) {
-        debug_trace.logf("auth", "Claude OAuth request rejected url={s}", .{url});
+        logRejectedOAuthBody(url, response.body);
         return error.ClaudeOAuthRequestFailed;
     }
     return response.takeBody();
+}
+
+fn jsonObjectPayload(alloc: Allocator, value: anytype) ![]u8 {
+    var body: std.Io.Writer.Allocating = .init(alloc);
+    errdefer body.deinit();
+    try std.json.Stringify.value(value, .{}, &body.writer);
+    return body.toOwnedSlice();
+}
+
+fn logRejectedOAuthBody(url: []const u8, body: []const u8) void {
+    var snippet: [160]u8 = undefined;
+    const n = @min(body.len, snippet.len);
+    @memcpy(snippet[0..n], body[0..n]);
+    for (snippet[0..n]) |*byte| {
+        if (byte.* < 0x20 or byte.* == 0x7f) byte.* = ' ';
+    }
+    debug_trace.logf("auth", "Claude OAuth request rejected url={s} body={s}", .{ url, snippet[0..n] });
 }
 
 fn dupeRequiredString(alloc: Allocator, object: std.json.ObjectMap, key: []const u8) ![]u8 {
@@ -1081,6 +1182,155 @@ test "Claude browser callback requires the exact path and state" {
             std.testing.allocator,
             "/other?code=auth&state=expected",
             "expected",
+        ),
+    );
+}
+
+test "Claude account identity prefers nested profile uuid and sends oauth headers" {
+    const State = struct {
+        authorization_seen: bool = false,
+        saw_version: bool = false,
+        saw_beta: bool = false,
+
+        fn execute(raw: ?*anyopaque, alloc: Allocator, request: oauth_transport.Request) !oauth_transport.Response {
+            const self: *@This() = @ptrCast(@alignCast(raw.?));
+            self.authorization_seen = std.mem.eql(u8, request.authorization orelse "", "Bearer access-token");
+            for (request.extra_headers) |header| {
+                if (std.mem.eql(u8, header.name, "anthropic-version") and
+                    std.mem.eql(u8, header.value, anthropic_api_version))
+                {
+                    self.saw_version = true;
+                }
+                if (std.mem.eql(u8, header.name, "anthropic-beta") and
+                    std.mem.eql(u8, header.value, oauth_beta))
+                {
+                    self.saw_beta = true;
+                }
+            }
+            return .{
+                .disposition = .accepted,
+                .body = try alloc.dupe(u8, "{\"account\":{\"uuid\":\"acct_test\"},\"organization\":{\"uuid\":\"org_test\"}}"),
+            };
+        }
+    };
+    var state = State{};
+    const account_id = try fetchAccountId(
+        std.testing.allocator,
+        .{ .context = &state, .execute_fn = State.execute },
+        "access-token",
+    );
+    defer std.testing.allocator.free(account_id);
+    try std.testing.expect(state.authorization_seen);
+    try std.testing.expect(state.saw_version);
+    try std.testing.expect(state.saw_beta);
+    try std.testing.expectEqualStrings("acct_test", account_id);
+}
+
+test "Claude account identity accepts OIDC sub when account uuid is absent" {
+    const State = struct {
+        fn execute(_: ?*anyopaque, alloc: Allocator, _: oauth_transport.Request) !oauth_transport.Response {
+            return .{ .disposition = .accepted, .body = try alloc.dupe(u8, "{\"sub\":\"acct_oidc\"}") };
+        }
+    };
+    const account_id = try fetchAccountId(
+        std.testing.allocator,
+        .{ .execute_fn = State.execute },
+        "access-token",
+    );
+    defer std.testing.allocator.free(account_id);
+    try std.testing.expectEqualStrings("acct_oidc", account_id);
+}
+
+test "Claude token exchange uses JSON with state and omits API headers" {
+    const State = struct {
+        method: ?oauth_transport.Method = null,
+        payload: [1024]u8 = undefined,
+        payload_len: usize = 0,
+        extra_header_count: usize = 0,
+
+        fn execute(raw: ?*anyopaque, alloc: Allocator, request: oauth_transport.Request) !oauth_transport.Response {
+            const self: *@This() = @ptrCast(@alignCast(raw.?));
+            const payload = request.payload orelse &.{};
+            self.method = request.method;
+            self.payload_len = @min(payload.len, self.payload.len);
+            @memcpy(self.payload[0..self.payload_len], payload[0..self.payload_len]);
+            self.extra_header_count = request.extra_headers.len;
+            return .{
+                .disposition = .accepted,
+                .body = try alloc.dupe(u8, "{\"access_token\":\"access\",\"refresh_token\":\"refresh\",\"expires_in\":3600}"),
+            };
+        }
+    };
+    var state = State{};
+    var token = try exchangeAuthorizationCodeForRedirectWithBounds(
+        std.testing.allocator,
+        .{ .context = &state, .execute_fn = State.execute },
+        "http://127.0.0.1:1/token",
+        "auth-code",
+        "verifier",
+        browser_redirect_uri,
+        "state-value",
+        null,
+        null,
+    );
+    defer token.deinit(std.testing.allocator);
+
+    try std.testing.expectEqual(oauth_transport.Method.post_json, state.method.?);
+    try std.testing.expectEqual(@as(usize, 0), state.extra_header_count);
+    const payload = state.payload[0..state.payload_len];
+    try std.testing.expect(std.mem.find(u8, payload, "\"grant_type\":\"authorization_code\"") != null);
+    try std.testing.expect(std.mem.find(u8, payload, "\"code\":\"auth-code\"") != null);
+    try std.testing.expect(std.mem.find(u8, payload, "\"state\":\"state-value\"") != null);
+    try std.testing.expect(std.mem.find(u8, payload, "\"client_id\":\"") != null);
+    try std.testing.expect(std.mem.find(u8, payload, "\"code_verifier\":\"verifier\"") != null);
+    try std.testing.expect(std.mem.find(u8, payload, "grant_type=authorization_code") == null);
+    try std.testing.expectEqualStrings("access", token.access_token);
+}
+
+test "Claude refresh uses JSON" {
+    const State = struct {
+        method: ?oauth_transport.Method = null,
+        payload: [512]u8 = undefined,
+        payload_len: usize = 0,
+
+        fn execute(raw: ?*anyopaque, alloc: Allocator, request: oauth_transport.Request) !oauth_transport.Response {
+            const self: *@This() = @ptrCast(@alignCast(raw.?));
+            const payload = request.payload orelse &.{};
+            self.method = request.method;
+            self.payload_len = @min(payload.len, self.payload.len);
+            @memcpy(self.payload[0..self.payload_len], payload[0..self.payload_len]);
+            return .{
+                .disposition = .accepted,
+                .body = try alloc.dupe(u8, "{\"access_token\":\"new-access\",\"expires_in\":3600}"),
+            };
+        }
+    };
+    var state = State{};
+    var response = try requestRefreshToken(
+        std.testing.allocator,
+        .{ .context = &state, .execute_fn = State.execute },
+        "{\"grant_type\":\"refresh_token\",\"client_id\":\"client\",\"refresh_token\":\"[redacted]\"}",
+    );
+    defer response.deinit(std.testing.allocator);
+
+    try std.testing.expectEqual(oauth_transport.Method.post_json, state.method.?);
+    try std.testing.expect(std.mem.find(u8, state.payload[0..state.payload_len], "\"grant_type\":\"refresh_token\"") != null);
+    try std.testing.expect(response.refresh_token == null);
+    try std.testing.expectEqual(@as(?i64, 3600), response.expires_in);
+}
+
+test "Claude account identity rejects unsafe userinfo bytes" {
+    const State = struct {
+        fn execute(_: ?*anyopaque, alloc: Allocator, _: oauth_transport.Request) !oauth_transport.Response {
+            return .{ .disposition = .accepted, .body = try alloc.dupe(u8, "{\"account\":{\"uuid\":\"acct\\ninjected\"}}") };
+        }
+    };
+    try std.testing.expectError(
+        error.InvalidClaudeUserInfoResponse,
+        fetchAccountId(
+            std.testing.allocator,
+            .{ .execute_fn = State.execute },
+            "access-token",
         ),
     );
 }

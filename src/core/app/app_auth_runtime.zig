@@ -359,6 +359,7 @@ pub fn Runtime(comptime App: type) type {
                     .login => try beginSignIn(app, true),
                     .chatgpt_login => try beginChatGptSignIn(app),
                     .grok_login => try beginGrokSignIn(app),
+                    .claude_login => try beginClaudeSignIn(app),
                     .setup => {
                         if (comptime !runtime_profile.allows(App, .native_auth)) {
                             try app.writeDomainNotice(.{
@@ -807,6 +808,54 @@ pub fn Runtime(comptime App: type) type {
             }
         }
 
+        fn beginClaudeSignIn(app: *App) !void {
+            if (try credentials.sourceExists(app.alloc, app.auth.secretStore(), .claude_subscription)) {
+                try switchProvider(app, .claude, false, .manual);
+                return;
+            }
+            if (comptime provider_runtime.supported(App)) {
+                const decision = decideProviderSwitch(.{
+                    .current = provider_runtime.provider(app),
+                    .target = .claude,
+                    .target_credential_ready = false,
+                    .intent = .post_oauth,
+                    .stream_active = app.stream.active,
+                    .queued_prompts = app.worker.queuedPromptCount(),
+                });
+                if (decision == .busy) {
+                    try app.writeDomainNotice(.{
+                        .topic = "auth",
+                        .tone = .warning,
+                        .body = "Claude sign-in is unavailable until active and queued work finishes.",
+                    }, true);
+                    return;
+                }
+            }
+            try app.flushBeforeBlockingExternalWork();
+            const started = app.auth.openClaudeSignInPickerFromRoot(app.alloc);
+            if (started catch |err| {
+                debug_trace.logf("auth", "Claude login failed err={s}", .{@errorName(err)});
+                try writeLoginError(app, .claude_subscription, err);
+                return;
+            }) {
+                app.shell.render_requests.request(.footer);
+                if (io_mod.getenv("FX_NO_OPEN_BROWSER") == null) try openSignInBrowser(app);
+            }
+        }
+
+        fn beginClaudeSignInForProviderSwitch(app: *App) !void {
+            try app.flushBeforeBlockingExternalWork();
+            const started = app.auth.openClaudeSignInPickerForProviderSwitch(app.alloc);
+            if (started catch |err| {
+                debug_trace.logf("auth", "Claude login failed err={s}", .{@errorName(err)});
+                try writeLoginError(app, .claude_subscription, err);
+                return;
+            }) {
+                app.shell.render_requests.request(.footer);
+                if (io_mod.getenv("FX_NO_OPEN_BROWSER") == null) try openSignInBrowser(app);
+            }
+        }
+
         fn switchProvider(
             app: *App,
             target: model_provider.ProviderId,
@@ -902,6 +951,10 @@ pub fn Runtime(comptime App: type) type {
                     try beginGrokSignInForProviderSwitch(app);
                     return;
                 }
+                if (target == .claude and allow_login) {
+                    try beginClaudeSignInForProviderSwitch(app);
+                    return;
+                }
                 try app.writeDomainNotice(.{
                     .topic = "provider",
                     .tone = .warning,
@@ -911,6 +964,8 @@ pub fn Runtime(comptime App: type) type {
                         "Run fx login codex, then try switching again."
                     else if (target == .grok)
                         "Run fx login grok, then try switching again."
+                    else if (target == .claude)
+                        "Run claude auth login, then try switching again."
                     else
                         credentials.missing_interactive_credential_message,
                 }, true);
@@ -1297,6 +1352,17 @@ pub fn Runtime(comptime App: type) type {
                     error.GrokAuthorizationFailed => .{ .topic = "auth", .tone = .@"error", .body = "Grok sign-in was denied. The current credential is unchanged." },
                     error.GrokLoginTimedOut, error.LoginTimedOut => .{ .topic = "auth", .tone = .warning, .body = "Grok sign-in expired. The current credential is unchanged; run /login to try again." },
                     else => .{ .topic = "auth", .tone = .@"error", .body = "Grok sign-in failed. The current credential is unchanged." },
+                }
+            else if (source == .claude_subscription)
+                switch (err) {
+                    error.ClaudeOAuthRequestFailed => .{ .topic = "auth", .tone = .@"error", .body = "Claude rejected the authorization code. The current credential is unchanged; run /login to try again." },
+                    error.ClaudeOAuthStateMismatch => .{ .topic = "auth", .tone = .@"error", .body = "Claude authorization state did not match. The current credential is unchanged; run /login to try again." },
+                    error.ClaudeUserInfoRequestFailed => .{ .topic = "auth", .tone = .@"error", .body = "Claude accepted the token but rejected the profile request. The current credential is unchanged." },
+                    error.InvalidClaudeUserInfoResponse => .{ .topic = "auth", .tone = .@"error", .body = "Claude accepted the token but returned an unexpected profile. The current credential is unchanged." },
+                    error.InvalidClaudeOAuthResponse => .{ .topic = "auth", .tone = .@"error", .body = "Claude returned an unexpected token response. The current credential is unchanged." },
+                    error.ClaudeRefreshTokenMissing => .{ .topic = "auth", .tone = .@"error", .body = "Claude did not return a refresh token. The current credential is unchanged." },
+                    error.LoginTimedOut => .{ .topic = "auth", .tone = .warning, .body = "Claude sign-in expired. The current credential is unchanged; run /login to try again." },
+                    else => .{ .topic = "auth", .tone = .@"error", .body = "Claude sign-in failed. The current credential is unchanged." },
                 }
             else switch (err) {
                 error.ClientIdMissing => .{ .topic = "auth", .tone = .@"error", .body = "fx login is not configured yet. The current credential is unchanged." },

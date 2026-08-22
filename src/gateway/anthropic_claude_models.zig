@@ -1,5 +1,6 @@
 const std = @import("std");
 const claude_oauth = @import("../core/auth/claude_oauth.zig");
+const claude_session = @import("../core/auth/claude_session.zig");
 const model_catalog = @import("../core/gateway/model_catalog.zig");
 const gateway_provider = @import("../core/gateway/gateway_provider.zig");
 const io_mod = @import("../core/shared/io.zig");
@@ -13,7 +14,7 @@ const max_catalog_bytes: usize = 4 * 1024 * 1024;
 const fetch_timeout_ms: i64 = 30_000;
 const default_models_endpoint = "https://api.anthropic.com/v1/models";
 const e2e_models_endpoint_env = "FX_E2E_ANTHROPIC_CLAUDE_MODELS_URL";
-const anthropic_version = "2023-06-01";
+const anthropic_version = claude_oauth.anthropic_api_version;
 
 pub const model_catalog_provider = model_catalog.Provider{
     .fetch_fn = fetchCatalogForProvider,
@@ -63,7 +64,9 @@ fn fetchCatalogForProvider(
         return .{ .failure = .{ .category = .authentication, .http_status = .unauthorized } };
     const account_id = input.access.accountId() orelse
         return .{ .failure = .{ .category = .authentication, .http_status = .unauthorized } };
-    _ = account_id;
+    if (!claude_session.validAccountId(account_id)) {
+        return .{ .failure = .{ .category = .authentication, .http_status = .unauthorized } };
+    }
     const request_url = modelsUrl(alloc) catch |err| {
         if (err == error.OutOfMemory) return error.OutOfMemory;
         return .{ .failure = .{ .category = .runtime } };
@@ -76,6 +79,7 @@ fn fetchCatalogForProvider(
         .alloc = alloc,
         .url = request_url,
         .credential = credential,
+        .account_id = account_id,
     };
     var response = gateway_client.runBoundedHttpOperation(
         FetchResponse,
@@ -122,6 +126,7 @@ const FetchOperation = struct {
     alloc: std.mem.Allocator,
     url: []const u8,
     credential: []const u8,
+    account_id: []const u8,
 
     pub fn run(self: *@This()) !FetchResponse {
         var client: std.http.Client = .{ .allocator = self.alloc, .io = io_mod.getIo() };
@@ -131,19 +136,22 @@ const FetchOperation = struct {
         const body_buffer = try self.alloc.alloc(u8, max_catalog_bytes + 1);
         defer secret.zeroAndFree(self.alloc, body_buffer);
         var response_writer = std.Io.Writer.fixed(body_buffer);
+        const extra_headers = [_]std.http.Header{
+            .{ .name = "anthropic-version", .value = anthropic_version },
+            .{ .name = "anthropic-beta", .value = claude_oauth.messages_beta },
+            .{ .name = "anthropic-account-uuid", .value = self.account_id },
+            .{ .name = "originator", .value = claude_oauth.messages_originator },
+            .{ .name = "accept", .value = "application/json" },
+        };
         const result = client.fetch(.{
             .location = .{ .url = self.url },
             .method = .GET,
             .headers = .{
                 .authorization = .{ .override = auth_header },
-                .user_agent = .{ .override = gateway_client.user_agent },
+                .user_agent = .{ .override = claude_oauth.messages_user_agent },
                 .accept_encoding = .omit,
             },
-            .extra_headers = &.{
-                .{ .name = "anthropic-version", .value = anthropic_version },
-                .{ .name = "originator", .value = "fx" },
-                .{ .name = "accept", .value = "application/json" },
-            },
+            .extra_headers = &extra_headers,
             .response_writer = &response_writer,
             .redirect_behavior = .unhandled,
         }) catch |err| switch (err) {

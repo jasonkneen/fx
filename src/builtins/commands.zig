@@ -137,7 +137,7 @@ pub const top_level_specs = [_]TopLevelSpec{
     .{
         .kind = .provider,
         .token = "provider",
-        .usage = "provider <gateway|codex|grok>",
+        .usage = "provider <gateway|codex|grok|claude>",
         .summary = "Choose the model provider used by fx",
     },
     .{
@@ -328,6 +328,10 @@ pub const top_level_flags = [_]TopLevelFlag{
     .{
         .usage = "--no-additional-dirs",
         .description = "Ignore saved additional directories",
+    },
+    .{
+        .usage = "--claude-tools on|off",
+        .description = "off: fx tools (default); on: Claude tools",
     },
     .{
         .usage = "-c, --continue",
